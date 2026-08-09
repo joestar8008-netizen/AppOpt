@@ -14,7 +14,6 @@ import android.view.ViewGroup
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.bottomsheet.BottomSheetDialog
-import kotlin.concurrent.thread
 import top.suto.appopt.databinding.FragmentHistoryListBinding
 import top.suto.appopt.databinding.DialogHistoryAppDeleteBinding
 import top.suto.appopt.databinding.DialogHistoryAppManageBinding
@@ -99,11 +98,25 @@ class HistoryListFragment : TopLevelFragment() {
         HISTORY_IO_EXECUTOR.execute {
             var cachedItems = emptyList<HistoryItem>()
             var items = emptyList<HistoryItem>()
+            var cachedReadSucceeded = false
+            var refreshedReadSucceeded = false
+            var loadError: Throwable? = null
             runCatching {
                 val db = AppOptDbHelper.getInstance(appContext)
-                cachedItems = runCatching { readHistoryItems(db) }
-                    .onFailure { android.util.Log.e("AppOpt", "读取历史数据库失败", it) }
-                    .getOrDefault(emptyList())
+                runCatching { db.pruneHistory() }
+                    .onSuccess { pruned ->
+                        if (pruned > 0) {
+                            android.util.Log.i("AppOpt", "历史数据库已清理 $pruned 条超出保留上限的记录")
+                        }
+                    }
+                    .onFailure { android.util.Log.w("AppOpt", "历史数据库保留策略执行失败", it) }
+                val cachedResult = runCatching { readHistoryItems(db) }
+                    .onFailure {
+                        loadError = it
+                        android.util.Log.e("AppOpt", "读取历史数据库失败", it)
+                    }
+                cachedReadSucceeded = cachedResult.isSuccess
+                cachedItems = cachedResult.getOrDefault(emptyList())
 
                 // 先显示数据库中已有的记录，不等待 Root 枚举和旧日志导入。
                 if (cachedItems.isNotEmpty()) {
@@ -121,12 +134,22 @@ class HistoryListFragment : TopLevelFragment() {
                                 android.util.Log.e("AppOpt", "导入 ${entry.pkg} 历史记录失败", it)
                             }
                         }
-                }.onFailure { android.util.Log.e("AppOpt", "枚举历史记录失败", it) }
+                }.onFailure {
+                    loadError = it
+                    android.util.Log.e("AppOpt", "枚举历史记录失败", it)
+                }
 
-                items = runCatching { readHistoryItems(db) }
-                    .onFailure { android.util.Log.e("AppOpt", "刷新历史数据库失败", it) }
-                    .getOrDefault(cachedItems)
-            }.onFailure { android.util.Log.e("AppOpt", "加载历史记录失败", it) }
+                val refreshedResult = runCatching { readHistoryItems(db) }
+                    .onFailure {
+                        loadError = it
+                        android.util.Log.e("AppOpt", "刷新历史数据库失败", it)
+                    }
+                refreshedReadSucceeded = refreshedResult.isSuccess
+                items = refreshedResult.getOrDefault(cachedItems)
+            }.onFailure {
+                loadError = it
+                android.util.Log.e("AppOpt", "加载历史记录失败", it)
+            }
 
             postHistoryUi(currentViewGeneration) {
                 val current = generation == loadGeneration
@@ -134,8 +157,16 @@ class HistoryListFragment : TopLevelFragment() {
                 if (current) {
                     loadCompleted = true
                     lastLoadFinishedAt = SystemClock.elapsedRealtime()
-                    render(items)
-                    if (items.isEmpty() && retryIfEmpty) scheduleEmptyRetry()
+                    val hasUsableResult = cachedReadSucceeded || refreshedReadSucceeded
+                    if (hasUsableResult) {
+                        render(items)
+                        if (items.isEmpty() && retryIfEmpty) scheduleEmptyRetry()
+                        if (loadError != null) toast("历史记录刷新不完整，已保留现有数据")
+                    } else {
+                        binding.listLoading.visibility = View.GONE
+                        if (historyAdapter?.hasItems() != true) render(emptyList())
+                        toast("历史记录加载失败：${loadError?.message ?: "数据库不可用"}")
+                    }
                 }
                 if (reloadPending) {
                     val retry = pendingRetryIfEmpty
@@ -211,6 +242,8 @@ class HistoryListFragment : TopLevelFragment() {
             notifyDataSetChanged()
         }
 
+        fun hasItems(): Boolean = items.isNotEmpty()
+
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): Holder = Holder(
             ItemHistoryAppBinding.inflate(LayoutInflater.from(parent.context), parent, false)
         )
@@ -271,33 +304,56 @@ class HistoryListFragment : TopLevelFragment() {
 
     private fun deleteAllHistory(pkg: String) {
         invalidateCurrentLoad()
-        thread {
-            DatabaseMigrator.withPackageLock(pkg) {
-                val db = AppOptDbHelper.getInstance(appContext)
-                db.deleteAllSessionsByPackage(pkg)
-                DaemonBridge.deleteHistory(pkg)
+        HISTORY_IO_EXECUTOR.execute {
+            val result = runCatching {
+                DatabaseMigrator.withPackageLock(pkg) {
+                    check(DaemonBridge.deleteHistory(pkg)) {
+                        "Root 历史文件未能删除"
+                    }
+                    val db = AppOptDbHelper.getInstance(appContext)
+                    db.deleteAllSessionsByPackage(pkg)
+                }
             }
             runOnUiThreadIfAlive {
-                toast("已删除历史记录")
-                loadHistory(retryIfEmpty = false)
+                result.fold(
+                    onSuccess = {
+                        toast("已删除历史记录")
+                        loadHistory(retryIfEmpty = false)
+                    },
+                    onFailure = { error ->
+                        android.util.Log.e(
+                            "AppOpt",
+                            "delete all history failed: pkg=$pkg",
+                            error
+                        )
+                        toast("删除失败：${error.message ?: "历史数据仍被保留"}")
+                        loadHistory(retryIfEmpty = false)
+                    }
+                )
             }
         }
     }
 
     private fun exportAllHistory(pkg: String) {
-        thread {
-            val sessions = DatabaseMigrator.withPackageLock(pkg) {
-                val db = AppOptDbHelper.getInstance(appContext)
-                db.getSessionsByPackage(
-                    pkg,
-                    preserveOriginalThreadOrder = true
-                ).sortedBy { it.epoch }
-            }
-            val result = if (sessions.isEmpty()) {
-                Result.failure(IllegalStateException("没有可导出的历史数据"))
-            } else {
-                writeOriginalHistoryFile(pkg, buildOriginalHistoryLog(sessions))
-            }
+        HISTORY_IO_EXECUTOR.execute {
+            val result = runCatching {
+                DatabaseMigrator.withPackageLock(pkg) {
+                    val db = AppOptDbHelper.getInstance(appContext)
+                    db.getSessionsByPackage(
+                        pkg,
+                        preserveOriginalThreadOrder = true
+                    ).sortedBy { it.epoch }
+                }
+            }.fold(
+                onSuccess = { sessions ->
+                    if (sessions.isEmpty()) {
+                        Result.failure(IllegalStateException("没有可导出的历史数据"))
+                    } else {
+                        writeOriginalHistoryFile(pkg, buildOriginalHistoryLog(sessions))
+                    }
+                },
+                onFailure = { error -> Result.failure(error) }
+            )
             runOnUiThreadIfAlive {
                 result.fold(
                     onSuccess = { toast("已导出到 $it") },
@@ -325,7 +381,10 @@ class HistoryListFragment : TopLevelFragment() {
                     .append('\n')
                 for (thread in session.threads) {
                     append(String.format(Locale.US, "%.2f %.2f %s|%s",
-                        thread.avg, thread.max, thread.name, thread.series))
+                        thread.avg,
+                        thread.max,
+                        HistoryFieldCodec.encodeName(thread.name),
+                        thread.series))
                     if (thread.details.isNotBlank()) append('|').append(thread.details)
                     append('\n')
                 }

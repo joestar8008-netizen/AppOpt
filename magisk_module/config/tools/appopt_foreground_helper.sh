@@ -61,18 +61,8 @@ helper_pids() {
         [ "$found" -eq 1 ] && return 0
     fi
 
-    # 兼容旧模块或索引尚未建立的启动窗口，系统工具仅作为降级。
-    if command -v pidof >/dev/null 2>&1; then
-        found=0
-        for pid in $(pidof "$NICE_NAME" 2>/dev/null); do
-            if is_helper_pid "$pid"; then
-                echo "$pid"
-                found=1
-            fi
-        done
-        [ "$found" -eq 1 ] && return 0
-    fi
-
+    # 首次开机时进程索引可能尚未生成，直接遍历 /proc。不要在看门狗关键路径
+    # 调用部分旧 ROM 上可能永久阻塞的 pidof/pgrep。
     for proc_dir in /proc/[0-9]*; do
         pid=${proc_dir##*/}
         [ -r "$proc_dir/cmdline" ] || continue

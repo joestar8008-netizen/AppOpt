@@ -50,6 +50,7 @@ class ResponsiveBottomNavigationView @JvmOverloads constructor(
         clipChildren = false
         clipToPadding = false
         setPadding(dp(6f), dp(5f), dp(6f), dp(5f))
+        minimumHeight = dp(64f)
         buildItems()
     }
 
@@ -86,6 +87,7 @@ class ResponsiveBottomNavigationView @JvmOverloads constructor(
             val content = LinearLayout(context).apply {
                 orientation = VERTICAL
                 gravity = Gravity.CENTER_HORIZONTAL
+                minimumHeight = dp(54f)
                 layoutParams = FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -116,13 +118,15 @@ class ResponsiveBottomNavigationView @JvmOverloads constructor(
             val label = TextView(context).apply {
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
-                    dp(18f)
+                    ViewGroup.LayoutParams.WRAP_CONTENT
                 ).apply { topMargin = dp(2f) }
+                minHeight = dp(18f)
                 gravity = Gravity.CENTER
                 setText(spec.title)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-                setSingleLine(true)
+                maxLines = 2
                 ellipsize = null
+                includeFontPadding = false
                 setTextColor(ContextCompat.getColor(context, R.color.nav_inactive))
                 importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
             }

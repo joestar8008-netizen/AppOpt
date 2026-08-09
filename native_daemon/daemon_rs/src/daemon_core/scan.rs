@@ -59,14 +59,16 @@ fn scan_proc(
     rules: &[Rule],
     index: &RuntimeRuleIndex,
     known_pids: &BTreeSet<i32>,
+    process_index: &ProcessIndex,
 ) -> io::Result<ProcScanResult> {
-    scan_proc_scoped(rules, index, known_pids, None)
+    scan_proc_indexed(rules, index, known_pids, process_index, None)
 }
 
 fn scan_proc_packages(
     rules: &[Rule],
     index: &RuntimeRuleIndex,
     known_pids: &BTreeSet<i32>,
+    process_index: &ProcessIndex,
     packages: &BTreeSet<String>,
 ) -> io::Result<ProcScanResult> {
     if packages.is_empty() {
@@ -76,24 +78,14 @@ fn scan_proc_packages(
             health_incomplete_packages: BTreeSet::new(),
         });
     }
-    // 包级扫描的完整性只受该包已知 PID 影响。否则一个无关系统进程的瞬时
-    // /proc 读取失败也会让当前应用无法生成健康负向证据。
-    let scoped_known_pids = match process_index_cached_package_pids(packages) {
-        Ok(cached_package_pids) => known_pids
-            .intersection(&cached_package_pids)
-            .copied()
-            .collect::<BTreeSet<_>>(),
-        // 缓存只负责缩小“不完整”的影响范围；缓存损坏时仍执行包级正向扫描，
-        // 并让全部已知 PID 保守参与完整性判断，绝不据此误停规则。
-        Err(_) => known_pids.clone(),
-    };
-    scan_proc_scoped(rules, index, &scoped_known_pids, Some(packages))
+    scan_proc_indexed(rules, index, known_pids, process_index, Some(packages))
 }
 
-fn scan_proc_scoped(
+fn scan_proc_indexed(
     rules: &[Rule],
     index: &RuntimeRuleIndex,
     known_pids: &BTreeSet<i32>,
+    process_index: &ProcessIndex,
     scope_packages: Option<&BTreeSet<String>>,
 ) -> io::Result<ProcScanResult> {
     if index.plan.is_empty() {
@@ -103,27 +95,28 @@ fn scan_proc_scoped(
             health_incomplete_packages: BTreeSet::new(),
         });
     }
-    // 全量扫描只枚举 /proc/<pid> 目录，不会直接扫全系统线程。
-    // 只有 PID 通过 appId 快路径或严格 cmdline 包名兜底后，才进入 /proc/<pid>/task 扫线程。
+    // 本轮数字 PID 快照已经重建/刷新了内存索引。这里直接按缓存 cmdline 预筛，
+    // 不再第二次枚举整个 /proc；真正使用前仍由 scan_process_path_scoped 重新读取
+    // UID、cmdline 和 starttime，缓存身份绝不会直接生成 affinity 动作。
+    let packages = scope_packages.unwrap_or(&index.plan.all_pkgs);
+    let mut candidate_pids = process_index_cached_package_pids(process_index, packages);
+    if scope_packages.is_none() {
+        // 已知目标即使本轮索引身份读取出现瞬时缺口，也必须进入最终身份复核。
+        candidate_pids.extend(known_pids.iter().copied());
+    }
+    let scoped_known_pids = known_pids
+        .intersection(&candidate_pids)
+        .copied()
+        .collect::<BTreeSet<_>>();
     let mut hits = Vec::new();
-    let mut complete = true;
+    let mut complete = process_index.snapshot_complete;
     let mut health_incomplete_packages = BTreeSet::new();
-    let proc_dir = Path::new("/proc");
-    for entry in fs::read_dir(proc_dir)? {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => {
-                complete = false;
-                continue;
-            }
-        };
-        let file_name = entry.file_name();
-        let Some(pid) = parse_pid(&file_name) else {
-            continue;
-        };
+    for pid in candidate_pids {
+        let indexed_package = indexed_candidate_package(process_index, pid, packages);
+        let proc_path = PathBuf::from(format!("/proc/{pid}"));
         match scan_process_path_scoped(
             pid,
-            &entry.path(),
+            &proc_path,
             rules,
             index,
             scope_packages,
@@ -136,14 +129,18 @@ fn scan_proc_scoped(
                 }
                 hits.push(hit);
             }
-            ProcessScanOutcome::Gone | ProcessScanOutcome::Unreadable
-                if known_pids.contains(&pid) =>
-            {
+            ProcessScanOutcome::Gone if scoped_known_pids.contains(&pid) => {
                 complete = false;
             }
-            ProcessScanOutcome::Gone
-            | ProcessScanOutcome::NotTarget
-            | ProcessScanOutcome::Unreadable => {}
+            ProcessScanOutcome::Unreadable => {
+                // 索引已经把该 PID 归属到目标包；即使它还没进入 known_pids，瞬时
+                // 读不到 UID/cmdline 也不能被当作“目标不存在”的完整负向证据。
+                complete = false;
+                if let Some(pkg) = indexed_package {
+                    health_incomplete_packages.insert(pkg);
+                }
+            }
+            ProcessScanOutcome::Gone | ProcessScanOutcome::NotTarget => {}
         }
     }
 
@@ -151,6 +148,20 @@ fn scan_proc_scoped(
         hits,
         complete,
         health_incomplete_packages,
+    })
+}
+
+fn indexed_candidate_package(
+    process_index: &ProcessIndex,
+    pid: i32,
+    packages: &BTreeSet<String>,
+) -> Option<String> {
+    process_index.entries.get(&pid).and_then(|entry| {
+        let base = entry
+            .cmdline
+            .split_once(':')
+            .map_or(entry.cmdline.as_str(), |(pkg, _)| pkg);
+        packages.contains(base).then_some(base.to_string())
     })
 }
 
@@ -365,7 +376,9 @@ fn scan_process_path_scoped(
 
     let cmdline = match read_cmdline(pid) {
         Ok(cmdline) if !cmdline.is_empty() => cmdline,
-        Ok(_) => return ProcessScanOutcome::NotTarget,
+        // 已存在的 Android 进程在 exec/退出竞态中可能短暂读到空 cmdline；这不是
+        // “已确认不属于目标包”的证据，按不可读保留到下一轮复核。
+        Ok(_) => return ProcessScanOutcome::Unreadable,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return ProcessScanOutcome::Gone,
         Err(_) => return ProcessScanOutcome::Unreadable,
     };
@@ -420,23 +433,52 @@ fn scan_process_path_scoped(
         .filter_map(|rule_index| rules.get(*rule_index))
         .filter(|rule| rule.thread.is_some())
         .collect();
+    let health_owner_rule_indices = index
+        .health_rules_by_owner
+        .get(cmdline.as_str())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let health_thread_rules = health_owner_rule_indices
+        .iter()
+        .filter_map(|rule_index| rules.get(*rule_index))
+        .filter(|rule| rule.thread.is_some())
+        .collect::<Vec<_>>();
+    let has_exact_process_health_rule = health_owner_rule_indices
+        .iter()
+        .filter_map(|rule_index| rules.get(*rule_index))
+        .any(|rule| rule.thread.is_none());
 
     let has_app_health_rules = index.health_rule_packages.contains(matched_base);
-    let needs_thread_scan = !process_rules.is_empty() || !thread_rules.is_empty();
-    let (actions, scanned_threads, threads_complete, thread_fingerprint) = if needs_thread_scan {
-        scan_threads(proc_path, &process_rules, &thread_rules)
+    let needs_thread_scan = !process_rules.is_empty()
+        || !thread_rules.is_empty()
+        || !health_thread_rules.is_empty();
+    let (
+        actions,
+        matched_rule_health_keys,
+        scanned_threads,
+        threads_complete,
+        thread_fingerprint,
+    ) = if needs_thread_scan {
+        scan_threads(
+            proc_path,
+            &process_rules,
+            &thread_rules,
+            &health_thread_rules,
+        )
     } else {
-        (Vec::new(), 0, true, None)
+        (Vec::new(), Vec::new(), 0, true, None)
     };
     // 缓存基础主进程可避免“只有尚未出现的健康目标”时每轮全量扫 /proc；缓存含线程
     // 规则的精确 owner，则能继续复用 task 扫描捕获稍后才出现的目标线程。
     // 这些保留项只服务扫描缓存，不参与前台生命周期判断。
     let keep_main_for_health = cmdline == matched_base && has_app_health_rules;
-    let keep_owner_for_thread_observation = !thread_rules.is_empty();
+    let keep_owner_for_thread_observation = !health_thread_rules.is_empty();
+    let keep_process_for_health = cmdline.contains(':') && has_exact_process_health_rule;
     if process_rules.is_empty()
         && actions.is_empty()
         && !keep_main_for_health
         && !keep_owner_for_thread_observation
+        && !keep_process_for_health
     {
         return ProcessScanOutcome::NotTarget;
     }
@@ -448,6 +490,7 @@ fn scan_process_path_scoped(
         cmdline,
         process_rules: process_rules.iter().map(|rule| rule.line()).collect(),
         actions,
+        matched_rule_health_keys,
         scanned_threads,
         health_scan_complete: pid_starttime.is_some() && threads_complete,
         thread_fingerprint: threads_complete.then_some(thread_fingerprint).flatten(),
@@ -475,16 +518,24 @@ fn scan_threads(
     proc_path: &Path,
     process_rules: &[&Rule],
     thread_rules: &[&Rule],
-) -> (Vec<ThreadAction>, usize, bool, Option<ThreadSetFingerprint>) {
+    health_thread_rules: &[&Rule],
+) -> (
+    Vec<ThreadAction>,
+    Vec<String>,
+    usize,
+    bool,
+    Option<ThreadSetFingerprint>,
+) {
     // Linux 线程名来自 /proc/<pid>/task/<tid>/comm，最多 15 字节，会被内核截断。
     // 因此规则匹配必须接受用户写的截断名或通配符，例如 Thread-*、binder:*。
     let task_dir = proc_path.join("task");
     let tasks = match fs::read_dir(task_dir) {
         Ok(tasks) => tasks,
-        Err(_) => return (Vec::new(), 0, false, None),
+        Err(_) => return (Vec::new(), Vec::new(), 0, false, None),
     };
 
     let mut actions = Vec::new();
+    let mut matched_rule_health_keys = BTreeSet::new();
     let mut scanned = 0;
     let mut complete = true;
     let mut fingerprint = ThreadSetFingerprint::default();
@@ -523,6 +574,17 @@ fn scan_threads(
                     .is_some_and(|pattern| glob_match(pattern, &name))
             })
             .collect::<Vec<_>>();
+        for rule in health_thread_rules.iter().copied().filter(|rule| {
+            rule.thread
+                .as_deref()
+                .is_some_and(|pattern| glob_match(pattern, &name))
+        }) {
+            matched_rule_health_keys.insert(rule_health_key(
+                'T',
+                &rule.owner,
+                rule.thread.as_deref().unwrap_or_default(),
+            ));
+        }
 
         if let Some(rule) = combine_rules(&matched_thread_rules) {
             actions.push(ThreadAction {
@@ -560,7 +622,13 @@ fn scan_threads(
         }
     }
 
-    (actions, scanned, complete, Some(fingerprint))
+    (
+        actions,
+        matched_rule_health_keys.into_iter().collect(),
+        scanned,
+        complete,
+        Some(fingerprint),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -590,5 +658,39 @@ fn combine_rules(rules: &[&Rule]) -> Option<CombinedRule> {
         })
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod scan_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn unreadable_indexed_child_is_attributed_to_its_exact_base_package() {
+        let process_index = ProcessIndex {
+            entries: BTreeMap::from([(
+                42,
+                ProcessIndexEntry {
+                    pid: 42,
+                    starttime: 7,
+                    first_seen_elapsed_ms: 1,
+                    comm: "worker".to_string(),
+                    cmdline: "com.example:worker".to_string(),
+                },
+            )]),
+            ..ProcessIndex::default()
+        };
+        let packages = BTreeSet::from(["com.example".to_string()]);
+
+        assert_eq!(
+            indexed_candidate_package(&process_index, 42, &packages).as_deref(),
+            Some("com.example")
+        );
+        assert!(indexed_candidate_package(
+            &process_index,
+            42,
+            &BTreeSet::from(["com.example.extra".to_string()])
+        )
+        .is_none());
     }
 }

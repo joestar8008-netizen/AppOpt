@@ -14,6 +14,8 @@ import android.widget.EditText
 import android.widget.GridLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.doOnPreDraw
 import com.google.android.material.bottomsheet.BottomSheetDialog
 import com.google.android.material.checkbox.MaterialCheckBox
@@ -57,10 +59,14 @@ class SettingsFragment : TopLevelFragment() {
     private val midCores = linkedSetOf<Int>()
     private val fallbackCores = linkedSetOf<Int>()
     private var autoSaveRunnable: Runnable? = null
+    /** cpuset 写入期间暂存的策略修改，等 cpuset 写入完成后用最新输入重新写入。 */
+    private var policySavePendingAfterCpuset = false
+    private var cpusetOperationId = 0L
     private var coreWarningRunnable: Runnable? = null
     private var coreWarningView: TextView? = null
     private var saveSeq = 0
     private var selectedSettingsTab = SettingsTab.RULES
+    private var pendingRestoredPolicyDraft: CalibPolicy? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private enum class SettingsTab(val title: String) {
@@ -72,6 +78,10 @@ class SettingsFragment : TopLevelFragment() {
         const val MIN_MODULE_VERSION_CODE = DaemonBridge.REQUIRED_MODULE_VERSION_CODE
         const val MIN_MODULE_VERSION_NAME = DaemonBridge.REQUIRED_MODULE_VERSION_NAME
         const val POLICY_REFRESH_INTERVAL_MS = 3_000L
+        const val STATE_SETTINGS_TAB = "settings_tab"
+        const val STATE_RULE_SCROLL_Y = "settings_rule_scroll_y"
+        const val STATE_PERFORMANCE_SCROLL_Y = "settings_performance_scroll_y"
+        const val STATE_POLICY_DRAFT = "settings_policy_draft"
         val POLICY_IO_EXECUTOR = Executors.newSingleThreadExecutor()
     }
 
@@ -88,7 +98,24 @@ class SettingsFragment : TopLevelFragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         prepareTopLevelPage(binding.settingsHeader)
+        applyBottomNavigationScrollClearance()
+        selectedSettingsTab = SettingsTab.entries.getOrElse(
+            savedInstanceState?.getInt(STATE_SETTINGS_TAB, selectedSettingsTab.ordinal)
+                ?: selectedSettingsTab.ordinal
+        ) { SettingsTab.RULES }
+        pendingRestoredPolicyDraft = savedInstanceState
+            ?.getString(STATE_POLICY_DRAFT)
+            ?.takeIf(String::isNotBlank)
+            ?.let { runCatching { CalibPolicy.parse(it) }.getOrNull() }
         setupSettingsTabs()
+        if (savedInstanceState != null) {
+            val ruleScrollY = savedInstanceState.getInt(STATE_RULE_SCROLL_Y, 0)
+            val performanceScrollY = savedInstanceState.getInt(STATE_PERFORMANCE_SCROLL_Y, 0)
+            binding.root.doOnPreDraw {
+                binding.ruleSettingsPage.scrollTo(0, ruleScrollY)
+                binding.performanceSettingsPage.scrollTo(0, performanceScrollY)
+            }
+        }
 
         binding.settingsHelpButton.setOnClickListener {
             (activity as? MainActivity)?.showUsageGuide(showAll = true)
@@ -111,6 +138,34 @@ class SettingsFragment : TopLevelFragment() {
         setPolicyInputsEnabled(false)
         updateCpusetNameRow()
         setPolicyStatus("正在读取策略")
+    }
+
+    private fun applyBottomNavigationScrollClearance() {
+        val root = binding.root
+        val ruleForm = binding.policyForm
+        val performanceForm = binding.performanceForm
+        val ruleBottom = ruleForm.paddingBottom
+        val performanceBottom = performanceForm.paddingBottom
+        val gap = resources.getDimensionPixelSize(R.dimen.bottom_navigation_scroll_gap)
+        ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
+            val navigationBottom = insets
+                .getInsets(WindowInsetsCompat.Type.navigationBars())
+                .bottom
+            ruleForm.setPadding(
+                ruleForm.paddingLeft,
+                ruleForm.paddingTop,
+                ruleForm.paddingRight,
+                ruleBottom + navigationBottom + gap
+            )
+            performanceForm.setPadding(
+                performanceForm.paddingLeft,
+                performanceForm.paddingTop,
+                performanceForm.paddingRight,
+                performanceBottom + navigationBottom + gap
+            )
+            insets
+        }
+        ViewCompat.requestApplyInsets(root)
     }
 
     private fun setupSettingsTabs() {
@@ -247,11 +302,12 @@ class SettingsFragment : TopLevelFragment() {
         setPolicyInputsEnabled(false)
         POLICY_IO_EXECUTOR.execute {
             try {
-                val root = DaemonBridge.hasRoot()
-                val version = if (root) DaemonBridge.readModuleVersion() else null
-                val file = if (root) DaemonBridge.readCalibPolicyRaw() else null
-                val cpusetSupported = root && DaemonBridge.supportsCustomCpuset()
-                val presentCpus = if (root) DaemonBridge.readPresentCpus() else emptySet()
+                val snapshot = DaemonBridge.readSettingsPolicySnapshot()
+                val root = snapshot.hasRoot
+                val version = snapshot.moduleVersion
+                val file = snapshot.policyFile
+                val cpusetSupported = root && snapshot.cpusetSupported
+                val presentCpus = if (root) snapshot.presentCpus else emptySet()
                 val rawPolicy = file?.takeIf { it.readSuccess }?.content?.takeIf { it.isNotBlank() }
                 val policy = rawPolicy
                     ?.takeIf { it.isNotBlank() }
@@ -269,7 +325,19 @@ class SettingsFragment : TopLevelFragment() {
                     lockedByPendingUpdate = file?.lockedByPendingUpdate == true
                     val moduleOk = version?.versionCode?.let { it >= MIN_MODULE_VERSION_CODE } == true
                     val moduleLabel = version?.let { "${it.versionName} (${it.versionCode})" }
-                    bindPolicy(policy)
+                    val restoredDraft = pendingRestoredPolicyDraft
+                    pendingRestoredPolicyDraft = null
+                    val canRestoreDraft = root && moduleOk && !lockedByPendingUpdate &&
+                        file?.readSuccess == true
+                    val boundPolicy = if (canRestoreDraft && restoredDraft != null) {
+                        restoredDraft.copy(
+                            cpusetName = policy.cpusetName,
+                            detectedTopologyBlock = policy.detectedTopologyBlock
+                        ).normalized()
+                    } else {
+                        policy
+                    }
+                    bindPolicy(boundPolicy)
                     this.cpusetSupported = cpusetSupported
                     binding.policyLockedNotice.visibility =
                         if (lockedByPendingUpdate || (root && !moduleOk)) View.VISIBLE else View.GONE
@@ -296,6 +364,10 @@ class SettingsFragment : TopLevelFragment() {
                     cpusetEditable = policyEditable && cpusetSupported
                     setPolicyInputsEnabled(policyEditable)
                     updateCpusetNameRow()
+                    if (canRestoreDraft && restoredDraft != null && boundPolicy != policy) {
+                        policySavePendingAfterCpuset = true
+                    }
+                    flushPendingPolicySaveIfReady()
                     markPolicyGuideLayoutReady(generation, currentViewGeneration)
                 }
             } catch (error: Exception) {
@@ -453,6 +525,10 @@ class SettingsFragment : TopLevelFragment() {
         autoSaveRunnable?.let { mainHandler.removeCallbacks(it) }
         val runnable = Runnable {
             autoSaveRunnable = null
+            if (cpusetBusy) {
+                policySavePendingAfterCpuset = true
+                return@Runnable
+            }
             val policy = readPolicyFromInputs() ?: return@Runnable
             savePolicy(policy, ++saveSeq)
         }
@@ -465,11 +541,23 @@ class SettingsFragment : TopLevelFragment() {
         autoSaveRunnable = null
     }
 
+    private fun flushPendingPolicySaveIfReady() {
+        if (!policySavePendingAfterCpuset || cpusetBusy || !policyEditable || _binding == null) {
+            return
+        }
+        policySavePendingAfterCpuset = false
+        schedulePolicySave(delayMs = 0L)
+    }
+
     private fun flushAutoSave() {
         val pending = autoSaveRunnable ?: return
         mainHandler.removeCallbacks(pending)
         autoSaveRunnable = null
         if (!policyEditable || suppressPolicyChange) return
+        if (cpusetBusy) {
+            policySavePendingAfterCpuset = true
+            return
+        }
         val policy = readPolicyFromInputs() ?: return
         savePolicy(policy, ++saveSeq)
     }
@@ -653,6 +741,8 @@ class SettingsFragment : TopLevelFragment() {
             }
 
             cpusetBusy = true
+            policySavePendingAfterCpuset = false
+            val operationId = ++cpusetOperationId
             updateCpusetNameRow()
             view.cpusetSave.isEnabled = false
             view.cpusetSave.text = "正在保存"
@@ -665,12 +755,14 @@ class SettingsFragment : TopLevelFragment() {
                     DaemonBridge.RustDaemonRestartStatus.FAILED
                 }
                 runOnUiThread {
-                    if (currentViewGeneration != viewGeneration || _binding == null ||
-                        isFinishing || isDestroyed) return@runOnUiThread
+                    if (operationId != cpusetOperationId) return@runOnUiThread
                     cpusetBusy = false
                     if (saved) {
                         currentCpusetName = requestedName
-                        dialog.dismiss()
+                        if (currentViewGeneration == viewGeneration && _binding != null &&
+                            !isFinishing && !isDestroyed) {
+                            dialog.dismiss()
+                        }
                         val message = when (restartStatus) {
                             DaemonBridge.RustDaemonRestartStatus.REQUESTED ->
                                 "已保存，Rust 守护将在数秒内自动重启"
@@ -679,13 +771,22 @@ class SettingsFragment : TopLevelFragment() {
                             DaemonBridge.RustDaemonRestartStatus.FAILED ->
                                 "已保存，自动重启失败；重启设备后生效"
                         }
-                        toast(message)
+                        if (currentViewGeneration == viewGeneration && _binding != null &&
+                            !isFinishing && !isDestroyed) {
+                            toast(message)
+                        }
                     } else {
-                        view.cpusetSave.isEnabled = true
-                        view.cpusetSave.text = "保存并重启守护"
-                        toast("运行设置保存失败，请检查 Root 或模块状态")
+                        if (currentViewGeneration == viewGeneration && _binding != null &&
+                            !isFinishing && !isDestroyed) {
+                            view.cpusetSave.isEnabled = true
+                            view.cpusetSave.text = "保存并重启守护"
+                            toast("运行设置保存失败，请检查 Root 或模块状态")
+                        }
                     }
-                    updateCpusetNameRow()
+                    if (_binding != null && currentViewGeneration == viewGeneration) {
+                        updateCpusetNameRow()
+                    }
+                    flushPendingPolicySaveIfReady()
                 }
             }
         }
@@ -793,7 +894,7 @@ class SettingsFragment : TopLevelFragment() {
             view.formatLegacySelected,
             current,
             CalibPolicy.RuleOutputFormat.LEGACY,
-            "旧版单行格式（默认）"
+            "旧版单行格式"
         )
         setRuleOutputFormatTitle(
             view.formatAuthorBlockTitle,
@@ -1204,6 +1305,20 @@ class SettingsFragment : TopLevelFragment() {
         super.onStop()
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putInt(STATE_SETTINGS_TAB, selectedSettingsTab.ordinal)
+        if (_binding != null) {
+            outState.putInt(STATE_RULE_SCROLL_Y, binding.ruleSettingsPage.scrollY)
+            outState.putInt(STATE_PERFORMANCE_SCROLL_Y, binding.performanceSettingsPage.scrollY)
+            if (policyLoaded && !formatConversionBusy) {
+                readPolicyFromInputs()?.let { policy ->
+                    outState.putString(STATE_POLICY_DRAFT, policy.toConfigText())
+                }
+            }
+        }
+        super.onSaveInstanceState(outState)
+    }
+
     override fun onDestroyView() {
         cancelAutoSave()
         policyLoadGeneration++
@@ -1215,7 +1330,6 @@ class SettingsFragment : TopLevelFragment() {
         coreWarningRunnable = null
         coreWarningView = null
         formatConversionBusy = false
-        cpusetBusy = false
         cpusetEditable = false
         _binding = null
         super.onDestroyView()

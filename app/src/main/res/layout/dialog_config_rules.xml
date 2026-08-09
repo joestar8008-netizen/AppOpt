@@ -99,22 +99,36 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="14dp"
-        android:gravity="center_vertical"
         android:orientation="horizontal">
 
-        <TextView
+        <LinearLayout
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="绑定规则"
-            android:textColor="@color/text_primary"
-            android:textSize="14sp"
-            android:textStyle="bold" />
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="绑定规则"
+                android:textColor="@color/text_primary"
+                android:textSize="14sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="3dp"
+                android:text="左滑规则后点击删除；子进程可展开查看子线程"
+                android:textColor="@color/text_secondary"
+                android:textSize="10.5sp" />
+        </LinearLayout>
 
         <TextView
             android:id="@+id/rulesFilterSummary"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:layout_gravity="center_vertical"
             android:textColor="@color/text_secondary"
             android:textSize="11sp"
             android:visibility="gone" />
@@ -224,6 +238,22 @@
         android:textColor="#C83B32"
         android:textSize="12sp"
         android:visibility="gone" />
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/rulesResetHealth"
+        style="@style/AppOutlinedButton"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:layout_marginTop="8dp"
+        android:contentDescription="重新检测异常规则"
+        android:text="重新检测异常规则"
+        android:textSize="13sp"
+        android:visibility="gone"
+        app:cornerRadius="8dp"
+        app:icon="@drawable/ic_search"
+        app:iconGravity="textStart"
+        app:iconPadding="6dp"
+        app:iconSize="18dp" />
 
     <LinearLayout
         android:layout_width="match_parent"

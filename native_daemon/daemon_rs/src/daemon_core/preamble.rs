@@ -8,7 +8,7 @@ use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,14 +26,20 @@ use std::os::unix::fs::MetadataExt;
 // 3. 日常只比较数字 PID 目录快照，并复查新增 PID；命中后缓存 PID 和线程结果。
 // 4. 写 affinity 前先读当前 Cpus_allowed_list，相同则跳过，避免重复抢系统调度配置。
 // 5. 写入后再读回一次，用于发现移植系统/厂商服务把线程绑核抢写回去的情况。
-const VERSION: &str = "1.8.5";
+const VERSION: &str = "1.8.6";
 const DEFAULT_CONFIG: &str = "/data/adb/modules/AppOpt/config/applist.conf";
 const STATE_DIR: &str = "/data/adb/modules/AppOpt/config/state";
 const DEFAULT_UID_MAP: &str = "/data/adb/modules/AppOpt/config/state/package_uid.map";
 const RULE_HEALTH_FILE: &str = "/data/adb/modules/AppOpt/config/state/rule_health.tsv";
+const RULE_HEALTH_RESET_FILE: &str =
+    "/data/adb/modules/AppOpt/config/state/rule_health.reset";
+const RULE_HEALTH_RESET_CLAIM_FILE: &str =
+    "/data/adb/modules/AppOpt/config/state/rule_health.reset.processing";
 const FOREGROUND_TASK_STATE_FILE: &str = "/data/adb/modules/AppOpt/config/foreground_task.state";
 const PROCESS_CACHE_FILE: &str = "/data/adb/modules/AppOpt/config/state/pid_cache.tsv";
 const PROCESS_INDEX_MAGIC: &str = "APPOPT_PROCESS_INDEX_V1";
+const MANAGED_TID_STATE_FILE: &str = "/data/adb/modules/AppOpt/config/state/managed_tids.tsv";
+const MANAGED_TID_STATE_MAGIC: &str = "APPOPT_MANAGED_TIDS_V1";
 const BOOT_ID_FILE: &str = "/proc/sys/kernel/random/boot_id";
 const FOREGROUND_TASK_MAX_AGE_MS: u64 = 12_000;
 const RULE_HEALTH_OBSERVE_SECS: u64 = 30;
@@ -43,6 +49,7 @@ const DEFAULT_INTERVAL_SECS: u64 = 2;
 const PID_SNAPSHOT_ACTIVE_MS: u64 = 2_000;
 const PID_SNAPSHOT_IDLE_MS: u64 = 10_000;
 const PID_DISCOVERY_RETRY_MS: u64 = 6_000;
+const PID_CACHE_WRITE_MIN_MS: u64 = 10_000;
 const PID_GROWTH_HINT_MIN_MS: u64 = 10_000;
 const PID_SNAPSHOT_LOG_INTERVAL_MS: u64 = 30_000;
 const SCREEN_OFF_SCAN_INTERVAL_MS: u64 = 10_000;
@@ -55,6 +62,8 @@ const BACKGROUND_AFFINITY_BUDGET_MS: u64 = 15;
 const FOREGROUND_AFFINITY_VERIFY_MS: u64 = 2_000;
 const ACTIVE_BACKGROUND_AFFINITY_VERIFY_MS: u64 = 2_000;
 const SCREEN_OFF_BACKGROUND_AFFINITY_VERIFY_MS: u64 = 10_000;
+const MAX_FOREGROUND_AFFINITY_CHECKS_PER_ROUND: usize = 256;
+const MAX_BACKGROUND_AFFINITY_CHECKS_PER_ROUND: usize = 128;
 const CPUSET_RETRY_INITIAL_MS: u64 = 10_000;
 const CPUSET_RETRY_MAX_MS: u64 = 5 * 60_000;
 const RUNTIME_CHANGE_LOG_INTERVAL_MS: u64 = 30_000;
@@ -70,6 +79,38 @@ const MAX_CONFIG_OWNER_BYTES: usize = 127;
 const MAX_CONFIG_THREAD_BYTES: usize = 31;
 static CURRENT_BOOT_ID: OnceLock<String> = OnceLock::new();
 static BOOT_ID_RETRY_AFTER_ELAPSED_MS: AtomicU64 = AtomicU64::new(0);
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+extern "C" fn appopt_shutdown_handler(_signal: libc::c_int) {
+    // 这里只做 lock-free 标记；文件、线程和 affinity 恢复必须在主循环退出后执行。
+    request_shutdown();
+}
+
+fn install_shutdown_handlers() -> io::Result<()> {
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    unsafe {
+        let mut action: libc::sigaction = mem::zeroed();
+        action.sa_sigaction = appopt_shutdown_handler as *const () as libc::sighandler_t;
+        action.sa_flags = 0;
+        libc::sigemptyset(&mut action.sa_mask);
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(Ordering::Relaxed)
+}
+
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+pub(crate) fn request_shutdown() {
+    SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+}
 #[cfg(any(target_os = "android", target_os = "linux"))]
 const DAEMON_SOCKET_NAME: &str = "appopt_daemon_top.suto.appopt_v1";
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -120,6 +161,8 @@ struct ProcHit {
     process_rules: Vec<String>,
     // 最终需要执行 sched_setaffinity 的线程动作。
     actions: Vec<ThreadAction>,
+    // 包含仅用于健康复核、当前不执行的规则命中。missed 规则仍需靠真实命中恢复。
+    matched_rule_health_keys: Vec<String>,
     scanned_threads: usize,
     // false 表示目标进程的 task/comm/starttime 扫描有缺口。正向命中仍可使用，
     // 但包含此命中的全量扫描不能作为规则健康的负向证据。
@@ -158,6 +201,8 @@ struct FullScanEvidence {
     incomplete_packages: BTreeSet<String>,
     // None 表示覆盖全部配置包；Some 只允许对应包消费这次负向证据。
     scanned_packages: Option<BTreeSet<String>>,
+    // 定时全扫结束时实际出现过的 owner，用于避免子进程未启动时误判其子线程规则。
+    observed_owners: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -172,7 +217,7 @@ struct ThreadAction {
     source: RuleSource,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ManagedTidEntry {
     tgid: i32,
     tgid_starttime: Option<u64>,
@@ -187,6 +232,15 @@ struct ManagedTidEntry {
     verified_mask_low64: Option<u64>,
     last_affinity_check_elapsed_ms: u64,
     next_affinity_check_elapsed_ms: u64,
+    // 第一次接管前的状态只保存在本次 daemon 生命周期内。规则删除或健康停用时
+    // 先迁回原 cpuset，再恢复原 affinity，避免线程残留在 AppOpt 的子组中。
+    original_mask_low64: Option<u64>,
+    original_cpuset: Option<String>,
+    // true 表示上述恢复基线已经成功写入 managed_tids.tsv。只有已持久化记录
+    // 才允许修改线程；写盘失败时旧记录继续工作，新记录留到下轮重试。
+    restore_persisted: bool,
+    // 规则已经消失但首次恢复被 ROM 暂时拒绝时，仅重试恢复，不再应用旧规则。
+    restore_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,7 +292,17 @@ struct DaemonState {
     // 只缓存已经通过 UID、cmdline、TGID 和 starttime 复查后产生动作的线程。
     // 它用于避免重复写入 cpuset，不作为规则命中或线程身份的最终依据。
     managed_tids: HashMap<i32, ManagedTidEntry>,
-    // 进程发现状态保存在共享 TSV，内存只记录调度节奏，不长期保存全量 PID 快照。
+    // 接管前状态会先原子写入 state/managed_tids.tsv，再修改 cpuset/affinity。
+    // daemon 异常退出后，新实例按 boot_id 和 starttime 续接同一份恢复基线。
+    managed_tid_journal_dirty: bool,
+    managed_tid_journal_loaded: bool,
+    // journal 损坏时无法知道哪些当前线程曾被旧 daemon 接管。损坏时刻之前创建的
+    // 未记录线程不再接管；它们退出后，新 starttime 身份可以正常进入管理。
+    managed_tid_quarantine_before_starttime: Option<u64>,
+    affinity_verify_cursor: usize,
+    // 进程索引在 daemon 生命周期内常驻内存；TSV 只负责跨进程查询和重启恢复。
+    // 常规轮次只枚举数字 PID，索引变化在本轮结束前批量原子写盘一次。
+    process_index: ProcessIndex,
     process_index_initialized: bool,
     process_index_has_candidates: bool,
     last_pid_snapshot_elapsed_ms: Option<u64>,
@@ -266,6 +330,9 @@ struct DaemonState {
     // inotify 事件只能提前检查配置，不能重置固定的常规扫描节奏。
     last_regular_scan_elapsed_ms: Option<u64>,
     interactive: bool,
+    // helper 短暂过期时沿用最后一次可信亮灭屏状态。首次尚无可信值时仍按亮屏处理，
+    // 避免 App 刚启动而 helper 尚未落盘时把发现周期错误放慢到息屏档。
+    interactive_known: bool,
     round_index: u64,
     logged_round_once: bool,
     last_runtime_summary_log_elapsed_ms: Option<u64>,
@@ -283,6 +350,8 @@ struct DaemonState {
     // 每个前台生命周期至多由健康检查主动触发一次全扫；不完整时等待正常扫描或下次启动。
     health_session_full_scan_attempted: BTreeSet<String>,
     health_session_lifecycle: HashMap<String, RuleHealthLifecycle>,
+    // 观察窗口结束时全扫实际出现过的 owner；子进程线程只有 owner 出现过才计 miss。
+    health_session_observed_owners: HashMap<String, BTreeSet<String>>,
     // 每个观察窗口只结算开始该窗口时尚待确认的规则。应用仍在同一次前台生命周期内
     // 新增规则时，只给新增规则开启新窗口，避免旧规则在一次启动里累计两次 miss。
     health_session_eligible_keys: HashMap<String, BTreeSet<String>>,
@@ -332,6 +401,8 @@ struct RuntimeRuleIndex {
     active_rule_indices: Vec<usize>,
     // owner -> 原始规则表下标；三条扫描路径共同复用这一份索引。
     rules_by_owner: HashMap<String, Vec<usize>>,
+    // 健康复核包含 missed 规则，但这些下标绝不会参与 affinity 动作生成。
+    health_rules_by_owner: HashMap<String, Vec<usize>>,
     // 存在线程/子进程健康规则的基础包，避免每扫描一个进程都遍历全部 owner。
     health_rule_packages: BTreeSet<String>,
     plan: ScanPlan,

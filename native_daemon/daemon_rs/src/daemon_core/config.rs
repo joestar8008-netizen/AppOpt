@@ -4,6 +4,7 @@
 // - com.pkg=0-3                         主进程/包名兜底规则
 // - com.pkg:push=0-3                    子进程规则
 // - com.pkg{RenderThread}=7             主进程线程规则
+// - com.pkg:push{Thread-*}=0-3           子进程线程规则
 // - com.pkg{Thread-*}=0-3               线程通配符规则
 // - com.pkg=auto                        等待校准，占位但不执行绑核
 //
@@ -136,6 +137,57 @@ fn parse_rule_key(left: &str, cpus: &str) -> Option<Rule> {
     })
 }
 
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn child_process_thread_rules_keep_the_full_owner() {
+        let rule = parse_rule_key("com.tencent.mobileqq:MSF{Thread_*}", "0-7")
+            .expect("子进程线程规则应可解析");
+        assert_eq!(rule.owner, "com.tencent.mobileqq:MSF");
+        assert_eq!(rule.thread.as_deref(), Some("Thread_*"));
+        assert_eq!(rule.cpus, "0-7");
+        assert!(!rule.auto);
+
+        let chrome = parse_rule_key(
+            "com.android.chrome:sandboxed_process0:org.chromium.content.app.\
+             SandboxedProcessService0:3{CrRendererMain}",
+            "7",
+        )
+        .expect("Chromium 多段子进程名称应可解析");
+        assert_eq!(chrome.thread.as_deref(), Some("CrRendererMain"));
+        assert_eq!(
+            chrome.owner,
+            "com.android.chrome:sandboxed_process0:org.chromium.content.app.\
+             SandboxedProcessService0:3"
+        );
+    }
+
+    #[test]
+    fn missed_rule_stays_in_read_only_health_index() {
+        let rule = parse_rule_key("com.example{RenderThread}", "4-7").unwrap();
+        let mut state = DaemonState::default();
+        let mut health = rule_health_entry_from_rule(&rule).unwrap();
+        health.status = RuleHealthStatus::Missed;
+        state
+            .rule_health
+            .insert(rule_health_entry_key(&health), health);
+
+        let index = build_runtime_rule_index(&[rule], &HashMap::new(), None, &state);
+        assert!(index.active_rule_indices.is_empty());
+        assert!(index.rules_by_owner.is_empty());
+        assert_eq!(
+            index
+                .health_rules_by_owner
+                .get("com.example")
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(index.plan.all_pkgs.contains("com.example"));
+    }
+}
+
 fn parse_uid_map(path: &Path) -> io::Result<HashMap<String, u32>> {
     parse_uid_map_with_key(path).map(|(map, _)| map)
 }
@@ -178,7 +230,7 @@ fn build_runtime_rule_index(
 ) -> RuntimeRuleIndex {
     let mut index = RuntimeRuleIndex::default();
     for (rule_index, rule) in rules.iter().enumerate() {
-        if rule.auto || rule_health_rule_disabled(rule, state) {
+        if rule.auto {
             continue;
         }
         let Some(base_pkg) = base_package(&rule.owner) else {
@@ -188,14 +240,13 @@ fn build_runtime_rule_index(
             continue;
         }
 
-        index.active_rule_indices.push(rule_index);
-        index
-            .rules_by_owner
-            .entry(rule.owner.clone())
-            .or_default()
-            .push(rule_index);
         if rule.thread.is_some() || rule.owner.contains(':') {
             index.health_rule_packages.insert(base_pkg.to_string());
+            index
+                .health_rules_by_owner
+                .entry(rule.owner.clone())
+                .or_default()
+                .push(rule_index);
         }
         index.plan.all_pkgs.insert(base_pkg.to_string());
         if let Some(uid) = uid_map.get(base_pkg) {
@@ -208,6 +259,15 @@ fn build_runtime_rule_index(
         } else {
             index.plan.fallback_pkgs.insert(base_pkg.to_string());
         }
+        if rule_health_rule_disabled(rule, state) {
+            continue;
+        }
+        index.active_rule_indices.push(rule_index);
+        index
+            .rules_by_owner
+            .entry(rule.owner.clone())
+            .or_default()
+            .push(rule_index);
     }
     index
 }

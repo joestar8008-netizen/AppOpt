@@ -18,6 +18,22 @@ import java.util.concurrent.Executors
 import top.suto.appopt.databinding.FragmentLogBinding
 import top.suto.appopt.databinding.ItemLogEntryBinding
 
+/** 日志行号来自 tail 窗口，会随窗口移动；稳定 ID 必须由事件内容本身生成。 */
+internal object StableLogEntryId {
+    private const val FNV_OFFSET_BASIS = -3750763034362895579L
+    private const val FNV_PRIME = 1099511628211L
+
+    fun from(sourceOrdinal: Int, text: String, occurrence: Int = 0): Long {
+        var hash = FNV_OFFSET_BASIS
+        hash = (hash xor sourceOrdinal.toLong()) * FNV_PRIME
+        for (char in text) {
+            hash = (hash xor char.code.toLong()) * FNV_PRIME
+        }
+        hash = (hash xor occurrence.toLong()) * FNV_PRIME
+        return if (hash == RecyclerView.NO_ID) hash xor Long.MIN_VALUE else hash
+    }
+}
+
 /** 将守护进程与前台助手日志解析为可筛选的结构化列表。 */
 class LogFragment : TopLevelFragment() {
 
@@ -28,13 +44,25 @@ class LogFragment : TopLevelFragment() {
     private lateinit var adapter: LogAdapter
     private var source = LogSource.DAEMON
     private var filter = LogFilter.ALL
-    private var loadGeneration = 0
+    private var viewGeneration = 0
+    private var listRenderGeneration = 0
     private var lastSelectedAt = 0L
     private val entriesBySource = mutableMapOf<LogSource, List<LogEntry>>()
     private val loadedAtBySource = mutableMapOf<LogSource, Long>()
+    private val loadGenerationBySource = mutableMapOf<LogSource, Int>()
+    private val loadsInFlight = mutableSetOf<LogSource>()
+    private val scrollAnchors = mutableMapOf<Pair<LogSource, LogFilter>, ScrollAnchor>()
+    private var renderedKey: Pair<LogSource, LogFilter>? = null
+
+    private data class ScrollAnchor(val id: Long, val position: Int, val offset: Int)
 
     private companion object {
         const val LOG_REFRESH_INTERVAL_MS = 5_000L
+        const val STATE_SOURCE = "log_source"
+        const val STATE_FILTER = "log_filter"
+        const val STATE_ANCHOR_ID = "log_anchor_id"
+        const val STATE_ANCHOR_POSITION = "log_anchor_position"
+        const val STATE_ANCHOR_OFFSET = "log_anchor_offset"
         val LOG_IO_EXECUTOR = Executors.newSingleThreadExecutor()
         val TAG_PATTERN = Regex("^\\[([^]]+)]\\s*")
         val NEUTRAL_COUNT_PATTERN = Regex(
@@ -76,7 +104,21 @@ class LogFragment : TopLevelFragment() {
         container: ViewGroup?,
         savedInstanceState: Bundle?
     ): View {
+        source = LogSource.entries.getOrElse(
+            savedInstanceState?.getInt(STATE_SOURCE, source.ordinal) ?: source.ordinal
+        ) { LogSource.DAEMON }
+        filter = LogFilter.entries.getOrElse(
+            savedInstanceState?.getInt(STATE_FILTER, filter.ordinal) ?: filter.ordinal
+        ) { LogFilter.ALL }
+        if (savedInstanceState?.containsKey(STATE_ANCHOR_ID) == true) {
+            scrollAnchors[source to filter] = ScrollAnchor(
+                id = savedInstanceState.getLong(STATE_ANCHOR_ID),
+                position = savedInstanceState.getInt(STATE_ANCHOR_POSITION, 0),
+                offset = savedInstanceState.getInt(STATE_ANCHOR_OFFSET, 0)
+            )
+        }
         _binding = FragmentLogBinding.inflate(inflater, container, false)
+        viewGeneration++
         return binding.root
     }
 
@@ -112,6 +154,7 @@ class LogFragment : TopLevelFragment() {
             override fun onTabSelected(tab: TabLayout.Tab) {
                 val next = LogSource.entries.getOrElse(tab.position) { LogSource.DAEMON }
                 if (source == next && entriesBySource.containsKey(next)) return
+                rememberCurrentScrollPosition()
                 source = next
                 renderCurrentSource(loading = !entriesBySource.containsKey(next))
                 val lastLoaded = loadedAtBySource[next] ?: 0L
@@ -128,9 +171,16 @@ class LogFragment : TopLevelFragment() {
     }
 
     private fun setupFilters() {
-        binding.logFilterGroup.check(R.id.logFilterAll)
+        binding.logFilterGroup.check(
+            when (filter) {
+                LogFilter.ATTENTION -> R.id.logFilterAttention
+                LogFilter.ERROR -> R.id.logFilterError
+                LogFilter.ALL -> R.id.logFilterAll
+            }
+        )
         binding.logFilterGroup.addOnButtonCheckedListener { _, checkedId, isChecked ->
             if (!isChecked) return@addOnButtonCheckedListener
+            rememberCurrentScrollPosition()
             filter = when (checkedId) {
                 R.id.logFilterAttention -> LogFilter.ATTENTION
                 R.id.logFilterError -> LogFilter.ERROR
@@ -148,26 +198,46 @@ class LogFragment : TopLevelFragment() {
         }
 
         val requestedSource = source
-        val generation = ++loadGeneration
+        if (!loadsInFlight.add(requestedSource)) {
+            if (entriesBySource.containsKey(requestedSource)) binding.logRefresh.isRefreshing = true
+            return
+        }
+        val generation = (loadGenerationBySource[requestedSource] ?: 0) + 1
+        loadGenerationBySource[requestedSource] = generation
+        val expectedViewGeneration = viewGeneration
         if (!entriesBySource.containsKey(requestedSource)) {
             renderCurrentSource(loading = true)
         } else {
             binding.logRefresh.isRefreshing = true
         }
         LOG_IO_EXECUTOR.execute {
-            val text = runCatching {
+            val result = runCatching {
                 when (requestedSource) {
                     LogSource.DAEMON -> DaemonBridge.readDaemonLog()
                     LogSource.FOREGROUND -> DaemonBridge.readForegroundHelperLog()
                 }
+            }.map { text ->
+                parseLog(requestedSource, text)
             }.onFailure {
                 android.util.Log.e("AppOpt", "读取${requestedSource.title}日志失败", it)
-            }.getOrDefault("")
-            val entries = parseLog(requestedSource, text)
+            }
             runOnUiThread {
-                if (_binding == null || generation != loadGeneration) return@runOnUiThread
-                entriesBySource[requestedSource] = entries
-                loadedAtBySource[requestedSource] = SystemClock.elapsedRealtime()
+                if (generation == loadGenerationBySource[requestedSource]) {
+                    loadsInFlight.remove(requestedSource)
+                }
+                if (_binding == null || expectedViewGeneration != viewGeneration ||
+                    generation != loadGenerationBySource[requestedSource]) return@runOnUiThread
+                result.fold(
+                    onSuccess = { entries ->
+                        entriesBySource[requestedSource] = entries
+                        loadedAtBySource[requestedSource] = SystemClock.elapsedRealtime()
+                    },
+                    onFailure = {
+                        if (source == requestedSource) {
+                            AppToast.show(requireContext(), "${requestedSource.title}日志读取失败")
+                        }
+                    }
+                )
                 if (source == requestedSource) renderCurrentSource(loading = false)
             }
         }
@@ -212,44 +282,47 @@ class LogFragment : TopLevelFragment() {
             else -> "切换到“全部”可查看其余运行记录"
         }
         binding.logRecycler.visibility = if (visible.isEmpty()) View.GONE else View.VISIBLE
+        val key = source to filter
+        val anchor = if (renderedKey == key) captureScrollAnchor() ?: scrollAnchors[key]
+        else scrollAnchors[key]
+        renderedKey = key
+        val renderGeneration = ++listRenderGeneration
         adapter.submitList(visible) {
-            if (visible.isNotEmpty() && _binding != null) {
-                binding.logRecycler.scrollToPosition(0)
+            if (_binding == null || renderGeneration != listRenderGeneration || visible.isEmpty()) {
+                return@submitList
             }
+            val layoutManager = binding.logRecycler.layoutManager as? LinearLayoutManager
+                ?: return@submitList
+            val target = anchor?.let { saved ->
+                visible.indexOfFirst { it.id == saved.id }.takeIf { it >= 0 }
+                    ?: saved.position.coerceIn(0, visible.lastIndex)
+            } ?: 0
+            layoutManager.scrollToPositionWithOffset(target, anchor?.offset ?: 0)
         }
+    }
+
+    private fun captureScrollAnchor(): ScrollAnchor? {
+        if (_binding == null || !::adapter.isInitialized || adapter.currentList.isEmpty()) return null
+        val layoutManager = binding.logRecycler.layoutManager as? LinearLayoutManager ?: return null
+        val position = layoutManager.findFirstVisibleItemPosition()
+        if (position !in adapter.currentList.indices) return null
+        val offset = layoutManager.findViewByPosition(position)?.top
+            ?.minus(binding.logRecycler.paddingTop) ?: 0
+        return ScrollAnchor(adapter.currentList[position].id, position, offset)
+    }
+
+    private fun rememberCurrentScrollPosition() {
+        captureScrollAnchor()?.let { scrollAnchors[source to filter] = it }
     }
 
     private fun parseLog(source: LogSource, text: String): List<LogEntry> {
         if (text.isBlank()) return emptyList()
-        val blocks = mutableListOf<Pair<Int, String>>()
-        var currentLine = 0
-        var current = StringBuilder()
-
-        fun flush() {
-            if (current.isEmpty()) return
-            blocks += currentLine to current.toString().trimEnd()
-            current = StringBuilder()
-        }
-
-        text.lineSequence().forEachIndexed { index, raw ->
-            if (raw.isBlank()) return@forEachIndexed
-            val continuation = current.isNotEmpty() && (
-                raw.firstOrNull()?.isWhitespace() == true ||
-                    raw.startsWith("at ") ||
-                    raw.startsWith("Caused by:") ||
-                    raw.startsWith("Suppressed:")
-                )
-            if (continuation) {
-                current.append('\n').append(raw.trimEnd())
-            } else {
-                flush()
-                currentLine = index + 1
-                current.append(raw.trim())
-            }
-        }
-        flush()
-
-        val chronological = blocks.map { (lineNumber, block) ->
+        val occurrences = mutableMapOf<String, Int>()
+        val chronological = LogBlockParser.split(text).map { parsed ->
+            val lineNumber = parsed.lineNumber
+            val block = parsed.text
+            val occurrence = occurrences.getOrDefault(block, 0)
+            occurrences[block] = occurrence + 1
             val match = TAG_PATTERN.find(block)
             val rawTag = match?.groupValues?.getOrNull(1).orEmpty()
             val tag = displayTag(source, rawTag)
@@ -259,7 +332,7 @@ class LogFragment : TopLevelFragment() {
                 block
             }
             LogEntry(
-                id = (source.ordinal.toLong() shl 32) or lineNumber.toLong(),
+                id = StableLogEntryId.from(source.ordinal, block, occurrence),
                 lineNumber = lineNumber,
                 tag = tag,
                 level = classifyLevel(block),
@@ -272,7 +345,6 @@ class LogFragment : TopLevelFragment() {
             val previous = merged.lastOrNull()
             if (previous != null && previous.copyText == entry.copyText) {
                 merged[merged.lastIndex] = previous.copy(
-                    id = entry.id,
                     lineNumber = entry.lineNumber,
                     repeatCount = previous.repeatCount + 1
                 )
@@ -318,9 +390,27 @@ class LogFragment : TopLevelFragment() {
         AppToast.show(requireContext(), "已复制这条日志")
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        rememberCurrentScrollPosition()
+        outState.putInt(STATE_SOURCE, source.ordinal)
+        outState.putInt(STATE_FILTER, filter.ordinal)
+        scrollAnchors[source to filter]?.let { anchor ->
+            outState.putLong(STATE_ANCHOR_ID, anchor.id)
+            outState.putInt(STATE_ANCHOR_POSITION, anchor.position)
+            outState.putInt(STATE_ANCHOR_OFFSET, anchor.offset)
+        }
+        super.onSaveInstanceState(outState)
+    }
+
     override fun onDestroyView() {
-        loadGeneration++
+        rememberCurrentScrollPosition()
+        listRenderGeneration++
+        loadGenerationBySource.keys.toList().forEach { key ->
+            loadGenerationBySource[key] = (loadGenerationBySource[key] ?: 0) + 1
+        }
+        loadsInFlight.clear()
         binding.logRecycler.adapter = null
+        renderedKey = null
         _binding = null
         super.onDestroyView()
     }

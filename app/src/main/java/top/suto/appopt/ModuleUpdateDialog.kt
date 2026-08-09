@@ -3,10 +3,16 @@ package top.suto.appopt
 import android.os.Handler
 import android.os.Looper
 import android.text.method.LinkMovementMethod
+import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import androidx.appcompat.app.AppCompatActivity
+import androidx.coordinatorlayout.widget.CoordinatorLayout
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.Observer
+import androidx.lifecycle.ViewModelProvider
 import com.google.android.material.bottomsheet.BottomSheetDialog
 import io.noties.markwon.Markwon
 import io.noties.markwon.ext.strikethrough.StrikethroughPlugin
@@ -14,59 +20,34 @@ import io.noties.markwon.ext.tables.TablePlugin
 import io.noties.markwon.ext.tasklist.TaskListPlugin
 import io.noties.markwon.html.HtmlPlugin
 import io.noties.markwon.linkify.LinkifyPlugin
-import kotlin.concurrent.thread
 import top.suto.appopt.databinding.DialogModuleUpdateBinding
 
 object ModuleUpdateDialog {
+    fun activeUpdate(activity: AppCompatActivity): ModuleUpdater.UpdateInfo? =
+        ViewModelProvider(activity)[ModuleUpdateDownloadViewModel::class.java].activeUpdate()
+
     fun show(
         activity: AppCompatActivity,
         update: ModuleUpdater.UpdateInfo,
         onDismiss: (() -> Unit)? = null
-    ) {
+    ): Boolean {
+        if (activity.isFinishing || activity.isDestroyed ||
+            !activity.lifecycle.currentState.isAtLeast(Lifecycle.State.CREATED)
+        ) return false
+        val viewModel = ViewModelProvider(activity)[ModuleUpdateDownloadViewModel::class.java]
+        if (!viewModel.attachDialog()) return false
+
         val view = DialogModuleUpdateBinding.inflate(activity.layoutInflater)
         val dialog = BottomSheetDialog(activity)
         val handler = Handler(Looper.getMainLooper())
-
-        fun inactive(): Boolean {
-            return activity.isFinishing || activity.isDestroyed || !dialog.isShowing
-        }
-
-        var downloading = false
-        var downloadHandle: ModuleUpdater.DownloadHandle? = null
-        var downloadedZipPath: String? = null
-        var artifactHandedOff = false
-
-        fun cancelUnhandedDownload() {
-            if (!downloading || artifactHandedOff) return
-            downloadHandle?.cancel()
-            downloadedZipPath?.let(ModuleUpdater::discardDownloadedModule)
-            downloading = false
-        }
-
+        var handoffScheduled = false
         val lifecycleObserver = object : DefaultLifecycleObserver {
             override fun onDestroy(owner: LifecycleOwner) {
                 handler.removeCallbacksAndMessages(null)
-                cancelUnhandedDownload()
+                viewModel.detachDialog()
             }
         }
         activity.lifecycle.addObserver(lifecycleObserver)
-
-        fun retainForManualInstall(zipPath: String, message: String) {
-            artifactHandedOff = true
-            view.updateInstallStatus.text = "正在保存模块 zip 到 Download"
-            thread {
-                val manualPath = ModuleUpdater.retainDownloadedModuleForManualInstall(activity, zipPath)
-                activity.runOnUiThread {
-                    if (inactive()) return@runOnUiThread
-                    downloading = false
-                    view.updateLater.isEnabled = true
-                    view.updateInstall.isEnabled = true
-                    view.updateInstall.text = "重试"
-                    view.updateInstallStatus.text = "$message\n模块已保存到：$manualPath"
-                    AppToast.show(activity, message)
-                }
-            }
-        }
 
         view.updateVersionSummary.text = "模块更新需要下载并刷入，重启后生效"
         view.updateCurrentVersion.text = "${update.localVersion} (${update.localVersionCode})"
@@ -80,120 +61,162 @@ object ModuleUpdateDialog {
             linksClickable = true
         }
 
+        fun launchInstaller(state: ModuleUpdateDownloadViewModel.State) {
+            if (handoffScheduled || state.stage != ModuleUpdateDownloadViewModel.Stage.READY_TO_INSTALL ||
+                !state.installAuthorized
+            ) {
+                return
+            }
+            val zipPath = state.zipPath ?: return
+            val targetUpdate = state.update ?: return
+            handoffScheduled = true
+            handler.postDelayed({
+                handoffScheduled = false
+                if (!dialog.isShowing || activity.isFinishing || activity.isDestroyed) {
+                    return@postDelayed
+                }
+                if (!viewModel.claimForInstall(zipPath)) return@postDelayed
+                try {
+                    activity.startActivity(UpdateInstallActivity.intent(activity, targetUpdate, zipPath))
+                    dialog.dismiss()
+                } catch (_: Exception) {
+                    viewModel.handoffFailed(
+                        activity.applicationContext,
+                        "打开刷入页面失败，请手动刷入"
+                    )
+                }
+            }, INSTALL_HANDOFF_DELAY_MS)
+        }
+
+        fun render(state: ModuleUpdateDownloadViewModel.State) {
+            val belongsToDialog = state.update?.let {
+                it.remoteVersionCode == update.remoteVersionCode && it.zipUrl == update.zipUrl
+            } == true
+            if (!belongsToDialog && state.stage != ModuleUpdateDownloadViewModel.Stage.IDLE) return
+
+            view.updateInstallStatus.visibility =
+                if (state.status.isBlank()) View.GONE else View.VISIBLE
+            view.updateInstallStatus.text = state.status
+            view.updateProgress.visibility = when (state.stage) {
+                ModuleUpdateDownloadViewModel.Stage.RESUME_READY,
+                ModuleUpdateDownloadViewModel.Stage.DOWNLOADING,
+                ModuleUpdateDownloadViewModel.Stage.DETECTING_MANAGER,
+                ModuleUpdateDownloadViewModel.Stage.READY_TO_INSTALL,
+                ModuleUpdateDownloadViewModel.Stage.RETAINING_MANUAL -> View.VISIBLE
+                else -> View.GONE
+            }
+            state.percent?.let {
+                view.updateProgress.isIndeterminate = false
+                view.updateProgress.progress = it.coerceIn(0, 100)
+            } ?: run {
+                view.updateProgress.isIndeterminate =
+                    state.stage == ModuleUpdateDownloadViewModel.Stage.DOWNLOADING
+            }
+
+            val busy = state.stage in setOf(
+                ModuleUpdateDownloadViewModel.Stage.DOWNLOADING,
+                ModuleUpdateDownloadViewModel.Stage.DETECTING_MANAGER,
+                ModuleUpdateDownloadViewModel.Stage.RETAINING_MANUAL
+            ) || (state.stage == ModuleUpdateDownloadViewModel.Stage.READY_TO_INSTALL &&
+                state.installAuthorized)
+            view.updateLater.isEnabled = !busy
+            view.updateInstall.isEnabled = state.stage in setOf(
+                ModuleUpdateDownloadViewModel.Stage.IDLE,
+                ModuleUpdateDownloadViewModel.Stage.RESUME_READY,
+                ModuleUpdateDownloadViewModel.Stage.FAILED,
+                ModuleUpdateDownloadViewModel.Stage.MANUAL_READY,
+                ModuleUpdateDownloadViewModel.Stage.READY_TO_INSTALL
+            ) && !(state.stage == ModuleUpdateDownloadViewModel.Stage.READY_TO_INSTALL &&
+                state.installAuthorized)
+            view.updateInstall.text = when (state.stage) {
+                ModuleUpdateDownloadViewModel.Stage.IDLE -> "下载并刷入"
+                ModuleUpdateDownloadViewModel.Stage.RESUME_READY -> "继续下载"
+                ModuleUpdateDownloadViewModel.Stage.DOWNLOADING -> "下载中"
+                ModuleUpdateDownloadViewModel.Stage.DETECTING_MANAGER -> "正在检测"
+                ModuleUpdateDownloadViewModel.Stage.READY_TO_INSTALL ->
+                    if (state.installAuthorized) "准备刷入" else "确认刷入"
+                ModuleUpdateDownloadViewModel.Stage.RETAINING_MANUAL -> "正在保存"
+                ModuleUpdateDownloadViewModel.Stage.MANUAL_READY,
+                ModuleUpdateDownloadViewModel.Stage.FAILED -> "重试"
+                ModuleUpdateDownloadViewModel.Stage.HANDED_OFF -> "已交接"
+            }
+            launchInstaller(state)
+        }
+
+        val observer = Observer<ModuleUpdateDownloadViewModel.State>(::render)
         view.updateProgress.progress = 0
-        view.updateLater.setOnClickListener { dialog.dismiss() }
+        view.updateLater.setOnClickListener {
+            viewModel.cancelSession(discardArtifact = true)
+            dialog.dismiss()
+        }
+        view.updateInstall.setOnClickListener {
+            when (viewModel.state.value?.stage) {
+                ModuleUpdateDownloadViewModel.Stage.FAILED,
+                ModuleUpdateDownloadViewModel.Stage.MANUAL_READY ->
+                    viewModel.retry(activity.applicationContext)
+                ModuleUpdateDownloadViewModel.Stage.RESUME_READY ->
+                    viewModel.start(activity.applicationContext, update)
+                ModuleUpdateDownloadViewModel.Stage.READY_TO_INSTALL -> {
+                    viewModel.authorizeInstall(activity.applicationContext)
+                    viewModel.state.value?.let(::launchInstaller)
+                }
+                ModuleUpdateDownloadViewModel.Stage.IDLE, null ->
+                    viewModel.start(activity.applicationContext, update)
+                else -> Unit
+            }
+        }
         dialog.setCancelable(false)
         dialog.setCanceledOnTouchOutside(false)
-        view.updateInstall.setOnClickListener {
-            if (downloading) return@setOnClickListener
-            downloading = true
-            dialog.setCancelable(false)
-            dialog.setCanceledOnTouchOutside(false)
-            view.updateLater.isEnabled = false
-            view.updateInstall.isEnabled = false
-            view.updateInstall.text = "下载中"
-            view.updateInstallStatus.visibility = View.VISIBLE
-            view.updateInstallStatus.text = "准备下载模块"
-            view.updateProgress.visibility = View.VISIBLE
-            view.updateProgress.isIndeterminate = false
-            view.updateProgress.progress = 0
-
-            downloadHandle = ModuleUpdater.downloadModule(
-                activity,
-                update,
-                object : ModuleUpdater.DownloadCallback {
-                override fun onProgress(message: String, percent: Int?) {
-                    if (inactive()) return
-                    view.updateInstallStatus.text = if (percent != null) {
-                        "$message（$percent%）"
-                    } else {
-                        message
-                    }
-                    if (percent != null) {
-                        view.updateProgress.isIndeterminate = false
-                        view.updateProgress.progress = percent
-                    }
-                }
-
-                override fun onSuccess(zipPath: String) {
-                    if (inactive()) return
-                    downloadedZipPath = zipPath
-                    view.updateInstallStatus.text = "下载完成，准备刷入模块"
-                    view.updateProgress.isIndeterminate = false
-                    view.updateProgress.progress = 100
-                    view.updateInstall.text = "准备刷入"
-                    handler.postDelayed({
-                        if (inactive()) return@postDelayed
-                        view.updateInstallStatus.text = "正在检测模块管理器"
-                        val detectStartedAt = System.currentTimeMillis()
-                        thread {
-                            val managerLabel = ModuleUpdater.detectRootManagerLabel()
-                            activity.runOnUiThread {
-                                if (inactive()) return@runOnUiThread
-                                val detectRemain = (1500L - (System.currentTimeMillis() - detectStartedAt))
-                                    .coerceAtLeast(0L)
-                                handler.postDelayed({
-                                    if (inactive()) return@postDelayed
-                                    if (managerLabel == null) {
-                                        retainForManualInstall(
-                                            zipPath,
-                                            "没有检测到可用的模块管理器，请手动刷入"
-                                        )
-                                        return@postDelayed
-                                    }
-                                    view.updateInstallStatus.text = "检测到 $managerLabel，准备刷入模块"
-                                    handler.postDelayed({
-                                        if (inactive()) return@postDelayed
-                                        try {
-                                            artifactHandedOff = true
-                                            activity.startActivity(UpdateInstallActivity.intent(activity, update, zipPath))
-                                            dialog.dismiss()
-                                        } catch (_: Exception) {
-                                            artifactHandedOff = false
-                                            retainForManualInstall(
-                                                zipPath,
-                                                "打开刷入页面失败，请手动刷入"
-                                            )
-                                        }
-                                    }, 1500L)
-                                }, detectRemain)
-                            }
-                        }
-                    }, 1500L)
-                }
-
-                override fun onFailure(message: String, recoverableZipPath: String?) {
-                    if (inactive()) return
-                    if (recoverableZipPath != null) {
-                        downloadedZipPath = recoverableZipPath
-                        retainForManualInstall(recoverableZipPath, message)
-                        return
-                    }
-                    downloading = false
-                    downloadHandle = null
-                    view.updateLater.isEnabled = true
-                    view.updateInstall.isEnabled = true
-                    view.updateInstall.text = "重试"
-                    view.updateProgress.isIndeterminate = false
-                    view.updateInstallStatus.visibility = View.VISIBLE
-                    view.updateInstallStatus.text = message
-                    AppToast.show(activity, message)
-                }
-                }
-            )
+        dialog.setContentView(view.root)
+        dialog.setOnShowListener {
+            dialog.behavior.apply {
+                state = com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
+                skipCollapsed = true
+                isHideable = false
+            }
+            configureSheetWidth(activity, dialog)
         }
         dialog.setOnDismissListener {
             handler.removeCallbacksAndMessages(null)
-            cancelUnhandedDownload()
+            viewModel.state.removeObserver(observer)
+            viewModel.detachDialog()
             activity.lifecycle.removeObserver(lifecycleObserver)
             onDismiss?.invoke()
         }
-        dialog.setContentView(view.root)
-        dialog.setOnShowListener {
-            dialog.behavior.skipCollapsed = true
-            dialog.behavior.isHideable = false
+        return try {
+            dialog.show()
+            viewModel.state.observe(activity, observer)
+            viewModel.resumeAuthorizedSession(activity.applicationContext)
+            true
+        } catch (_: RuntimeException) {
+            handler.removeCallbacksAndMessages(null)
+            viewModel.state.removeObserver(observer)
+            activity.lifecycle.removeObserver(lifecycleObserver)
+            viewModel.detachDialog()
+            // show() 失败时不会触发 BottomSheet 的 dismiss 回调，主动释放调用方的忙碌状态。
+            onDismiss?.invoke()
+            false
         }
-        dialog.show()
+    }
+
+    private fun configureSheetWidth(activity: AppCompatActivity, dialog: BottomSheetDialog) {
+        val sheet = dialog.findViewById<View>(
+            com.google.android.material.R.id.design_bottom_sheet
+        ) ?: return
+        val availableWidth = activity.resources.displayMetrics.widthPixels
+        val density = activity.resources.displayMetrics.density
+        val maxWidth = (560f * density + 0.5f).toInt()
+        val margin = (32f * density + 0.5f).toInt()
+        val params = sheet.layoutParams
+        params.width = if (activity.resources.configuration.smallestScreenWidthDp >= 600) {
+            minOf(maxWidth, (availableWidth - margin).coerceAtLeast(1))
+        } else {
+            ViewGroup.LayoutParams.MATCH_PARENT
+        }
+        if (params is CoordinatorLayout.LayoutParams) {
+            params.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+        }
+        sheet.layoutParams = params
     }
 
     private fun markdownRenderer(activity: AppCompatActivity): Markwon {
@@ -205,4 +228,6 @@ object ModuleUpdateDialog {
             .usePlugin(LinkifyPlugin.create())
             .build()
     }
+
+    private const val INSTALL_HANDOFF_DELAY_MS = 700L
 }

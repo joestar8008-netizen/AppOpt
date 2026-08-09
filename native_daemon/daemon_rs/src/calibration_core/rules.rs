@@ -3,26 +3,36 @@
 // 规则生成原则：
 // - 主进程最重线程可进入 best_thread 档。
 // - 主进程其他重负载线程进入 group_high/group_mid 档。
-// - 子进程只生成 com.pkg:proc=cpus，不生成 com.pkg:proc{thread}=cpus。
+// - 子进程自动校准只生成 com.pkg:proc=cpus；守护仍支持用户手写 com.pkg:proc{thread}=cpus。
 // - 最后总是追加主包名兜底规则，避免没有单独命中的线程跑到未指定核心。
 //
 // 这里的目标不是“生成越多规则越好”，而是生成用户能理解且守护进程能稳定执行的规则。
 fn finish_session(session: CalibSession, config_file: &Path) -> io::Result<()> {
-    // 60 轮 * 500ms 约等于 30 秒，采样太短时负载峰值很容易误判。
-    if session.rounds < CALIB_MIN_ROUNDS {
+    let sampled_duration = session.sampled_duration();
+    let CalibSession {
+        pkg,
+        records: session_records,
+        child_threads,
+        rounds,
+        ..
+    } = session;
+    // 用真实的主进程活跃时间判断，不把 /proc 扫描耗时错误地当成固定 500ms 轮次。
+    // 命令可能落在两个 500ms 采样点之间，允许一个采样间隔的边界误差。
+    if sampled_duration.saturating_add(SAMPLE_INTERVAL) < CALIB_MIN_DURATION {
         println!(
-            "[CALIB] 采样时长不足: pkg={} 轮次={} 最少需要={}",
-            session.pkg, session.rounds, CALIB_MIN_ROUNDS
+            "[CALIB] 采样时长不足: pkg={} 有效时长={:.1}秒 轮次={} 最少需要={:.0}秒",
+            pkg,
+            sampled_duration.as_secs_f64(),
+            rounds,
+            CALIB_MIN_DURATION.as_secs_f64()
         );
-        write_state(&format!("done {};reason=short", session.pkg))?;
+        write_state(&format!("done {pkg};reason=short"))?;
         return Ok(());
     }
 
-    let mut records: Vec<LoadRecord> = session
-        .records
-        .values()
-        .filter(|record| !record.samples.is_empty())
-        .cloned()
+    let mut records: Vec<LoadRecord> = session_records
+        .into_values()
+        .filter(|record| record.sample_count > 0)
         .collect();
     records.sort_by(|a, b| {
         b.avg()
@@ -31,52 +41,71 @@ fn finish_session(session: CalibSession, config_file: &Path) -> io::Result<()> {
     });
 
     if records.is_empty() {
-        println!("[CALIB] 未检测到明显负载: pkg={}", session.pkg);
-        write_state(&format!("done {};reason=no_load", session.pkg))?;
+        println!("[CALIB] 未检测到明显负载: pkg={pkg}");
+        write_state(&format!("done {pkg};reason=no_load"))?;
         return Ok(());
     }
 
+    // 历史页不需要保存所有低价值短命线程；子进程记录优先保留，剩余位置按负载顺序填充。
+    let mut history_records = records
+        .iter()
+        .filter(|record| record.is_process)
+        .take(HISTORY_MAX_RECORDS)
+        .collect::<Vec<_>>();
+    if history_records.len() < HISTORY_MAX_RECORDS {
+        history_records.extend(
+            records
+                .iter()
+                .filter(|record| !record.is_process)
+                .take(HISTORY_MAX_RECORDS - history_records.len()),
+        );
+    }
+
     // 历史记录优先落盘；即使规则生成或写回失败，App 仍可导入这次采样数据辅助排查。
+    let history_rounds = ((sampled_duration.as_secs_f64() * 2.0).round() as usize).max(1);
     if let Err(err) = write_history(
-        &session.pkg,
-        session.rounds,
-        &records,
-        &session.child_threads,
+        &pkg,
+        history_rounds,
+        rounds,
+        &history_records,
+        &child_threads,
     ) {
-        eprintln!("[CALIB] 历史记录写入失败: pkg={} err={}", session.pkg, err);
+        eprintln!("[CALIB] 历史记录写入失败: pkg={pkg} err={err}");
     } else {
         println!(
-            "[CALIB] 历史记录已写入: pkg={} 轮次={} 负载项={} 子进程线程摘要={} Top=[{}]",
-            session.pkg,
-            session.rounds,
+            "[CALIB] 历史记录已写入: pkg={} 时长={:.1}秒 轮次={} 负载项={} 候选总数={} 子进程线程摘要={} Top=[{}]",
+            pkg,
+            sampled_duration.as_secs_f64(),
+            rounds,
+            history_records.len(),
             records.len(),
-            session.child_threads.len(),
+            child_threads.len(),
             top_record_summary(records.iter(), 8)
         );
     }
     if !records.iter().any(|record| record.sum_pct > 0.0) {
-        println!("[CALIB] 未生成规则: pkg={} reason=no_load", session.pkg);
-        write_state(&format!("done {};reason=no_load", session.pkg))?;
+        println!("[CALIB] 未生成规则: pkg={pkg} reason=no_load");
+        write_state(&format!("done {pkg};reason=no_load"))?;
         return Ok(());
     }
-    let rules = generate_rules(&session.pkg, &records);
+    let rules = generate_rules(&pkg, &records);
     if rules.is_empty() {
-        println!("[CALIB] 未生成规则: pkg={} reason=no_load", session.pkg);
-        write_state(&format!("done {};reason=no_load", session.pkg))?;
+        println!("[CALIB] 未生成规则: pkg={pkg} reason=no_load");
+        write_state(&format!("done {pkg};reason=no_load"))?;
         return Ok(());
     }
 
-    if write_rules_back(config_file, &session.pkg, &rules) {
+    if write_rules_back(config_file, &pkg, &rules) {
         println!(
             "[CALIB] 已生成规则: pkg={} 行数={}\n{}",
-            session.pkg,
+            pkg,
             rules.len(),
             rules.join("\n")
         );
-        write_state(&format!("done {}", session.pkg))?;
+        write_state(&format!("done {pkg}"))?;
     } else {
-        eprintln!("[CALIB] 规则写回配置文件失败: pkg={}", session.pkg);
-        write_state(&format!("done {};reason=write_fail", session.pkg))?;
+        eprintln!("[CALIB] 规则写回配置文件失败: pkg={pkg}");
+        write_state(&format!("done {pkg};reason=write_fail"))?;
     }
     Ok(())
 }
@@ -225,7 +254,7 @@ fn generate_rules(pkg: &str, records: &[LoadRecord]) -> Vec<String> {
         }
     }
 
-    // 子进程线程名通常过碎且规则语法不支持 com.app:proc{thread}，这里只绑定子进程整体。
+    // 子进程线程名通常过碎且生命周期短，自动校准只绑定子进程整体，避免生成大量易失规则。
     for tier in [RuleTier::High, RuleTier::Mid] {
         for record in records
             .iter()

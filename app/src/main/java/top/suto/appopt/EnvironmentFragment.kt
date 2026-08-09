@@ -27,6 +27,13 @@ class EnvironmentFragment : TopLevelFragment() {
     private var cachedUpdateInfo: ModuleUpdater.UpdateInfo? = null
     private var cachedUpdateResult: ModuleUpdater.CheckResult? = null
     private var updateCheckStarted = false
+    private var sceneDetailsExpanded = false
+    private var sceneActionInFlight = false
+    private var sceneNamespacePid: Int? = null
+    private var lastSceneRoot = false
+    private var lastScenePendingUpdate = false
+    private var lastSceneCompatible = false
+    private var lastSceneState: DaemonBridge.SceneCoreAllocationState? = null
 
     private data class ForegroundSnapshot(
         val state: DaemonBridge.TaskForegroundState,
@@ -39,7 +46,8 @@ class EnvironmentFragment : TopLevelFragment() {
         val version: DaemonBridge.ModuleVersion?,
         val compatible: Boolean,
         val runtime: DaemonBridge.DaemonRuntime,
-        val foreground: ForegroundSnapshot?
+        val foreground: ForegroundSnapshot?,
+        val sceneCoreAllocation: DaemonBridge.SceneCoreAllocationState?
     )
 
     override fun onCreateView(
@@ -60,11 +68,22 @@ class EnvironmentFragment : TopLevelFragment() {
         binding.environmentUsageButton.setOnClickListener { requestUsageAccess() }
         binding.environmentRefreshButton.setOnClickListener { refreshEnvironment(force = true) }
         binding.environmentRefresh.setOnRefreshListener { refreshEnvironment(force = true) }
+        binding.environmentSceneCoreRow.setOnClickListener {
+            sceneDetailsExpanded = !sceneDetailsExpanded
+            bindSceneDetailsExpanded(animate = true)
+        }
+        binding.environmentSceneAppsClose.setOnClickListener {
+            disableSceneCoreAllocation(DaemonBridge.SceneCoreAllocationTarget.APPS)
+        }
+        binding.environmentSceneGamesClose.setOnClickListener {
+            disableSceneCoreAllocation(DaemonBridge.SceneCoreAllocationTarget.GAMES)
+        }
         binding.environmentDiagnosticRow.setOnClickListener { exportDiagnosticPackage() }
         binding.environmentUpdateButton.setOnClickListener {
             cachedUpdateInfo?.let(::showModuleUpdateDialog) ?: checkModuleUpdate(manual = true)
         }
         bindPermissionState()
+        bindActiveModuleUpdateSessionIfNeeded()
     }
 
     override fun onTopLevelPageSelected() {
@@ -119,7 +138,23 @@ class EnvironmentFragment : TopLevelFragment() {
                 } else {
                     null
                 }
-                EnvironmentSnapshot(root, pendingUpdate, version, compatible, runtime, foreground)
+                val sceneCoreAllocation = if (root && compatible && !pendingUpdate) {
+                    DaemonBridge.readSceneCoreAllocationState(
+                        runtime.pid,
+                        foreground?.state?.sceneInstalled
+                    )
+                } else {
+                    null
+                }
+                EnvironmentSnapshot(
+                    root,
+                    pendingUpdate,
+                    version,
+                    compatible,
+                    runtime,
+                    foreground,
+                    sceneCoreAllocation
+                )
             }
             runOnUiThread {
                 if (currentViewGeneration != viewGeneration || generation != refreshGeneration ||
@@ -139,6 +174,13 @@ class EnvironmentFragment : TopLevelFragment() {
                         snapshot.compatible,
                         snapshot.foreground
                     )
+                    bindSceneCoreAllocationState(
+                        snapshot.root,
+                        snapshot.pendingUpdate,
+                        snapshot.compatible,
+                        snapshot.sceneCoreAllocation
+                    )
+                    sceneNamespacePid = snapshot.runtime.pid
                     binding.environmentModuleVersion.text = when {
                         !snapshot.root -> "需要 Root 权限"
                         snapshot.pendingUpdate -> "更新待重启"
@@ -150,6 +192,10 @@ class EnvironmentFragment : TopLevelFragment() {
                     setStatus(binding.environmentDotRoot, binding.environmentRootState, "检查失败", R.color.status_warn)
                     setStatus(binding.environmentDotDaemon, binding.environmentDaemonState, "检查失败", R.color.status_warn)
                     setStatus(binding.environmentDotForeground, binding.environmentForegroundState, "检查失败", R.color.status_warn)
+                    if (binding.environmentSceneSection.visibility == View.VISIBLE) {
+                        setSceneCoreStatus("检查失败", R.color.status_warn)
+                        setSceneDetailStatus(null, null)
+                    }
                     binding.environmentModuleVersion.text = "检查失败"
                 }
                 binding.environmentRefresh.isRefreshing = false
@@ -169,6 +215,10 @@ class EnvironmentFragment : TopLevelFragment() {
         setStatus(binding.environmentDotRoot, binding.environmentRootState, "检查中", R.color.status_warn)
         setStatus(binding.environmentDotDaemon, binding.environmentDaemonState, "检查中", R.color.status_warn)
         setStatus(binding.environmentDotForeground, binding.environmentForegroundState, "检查中", R.color.status_warn)
+        if (binding.environmentSceneSection.visibility == View.VISIBLE) {
+            setSceneCoreStatus("检查中", R.color.status_warn)
+            setSceneDetailStatus(null, null)
+        }
         binding.environmentModuleVersion.text = "检查中"
     }
 
@@ -239,6 +289,149 @@ class EnvironmentFragment : TopLevelFragment() {
         setStatus(binding.environmentDotForeground, binding.environmentForegroundState, text, color)
     }
 
+    private fun bindSceneCoreAllocationState(
+        root: Boolean,
+        pendingUpdate: Boolean,
+        compatible: Boolean,
+        state: DaemonBridge.SceneCoreAllocationState?
+    ) {
+        lastSceneRoot = root
+        lastScenePendingUpdate = pendingUpdate
+        lastSceneCompatible = compatible
+        lastSceneState = state
+        if (state == null ||
+            state.availability == DaemonBridge.SceneCoreAllocationAvailability.NOT_INSTALLED ||
+            state.availability == DaemonBridge.SceneCoreAllocationAvailability.UNKNOWN) {
+            sceneDetailsExpanded = false
+            binding.environmentSceneSection.visibility = View.GONE
+            bindSceneDetailsExpanded(animate = false)
+            return
+        }
+        binding.environmentSceneSection.visibility = View.VISIBLE
+        val (text, color) = when {
+            !root -> "未知" to R.color.status_off
+            pendingUpdate -> "待重启" to R.color.status_warn
+            !compatible -> "模块需更新" to R.color.status_warn
+            state.availability == DaemonBridge.SceneCoreAllocationAvailability.CONFIG_MISSING ->
+                "未检测到配置" to R.color.status_off
+            state.availability == DaemonBridge.SceneCoreAllocationAvailability.READ_ERROR ->
+                "检查失败" to R.color.status_warn
+            state.enabled -> "可能冲突" to R.color.status_warn
+            state.inApps == false && state.inGames == false ->
+                "未开启" to R.color.status_ok
+            else -> "配置异常" to R.color.status_warn
+        }
+        setSceneCoreStatus(text, color)
+        setSceneDetailStatus(
+            if (state?.availability == DaemonBridge.SceneCoreAllocationAvailability.AVAILABLE) {
+                state.inApps
+            } else {
+                null
+            },
+            if (state?.availability == DaemonBridge.SceneCoreAllocationAvailability.AVAILABLE) {
+                state.inGames
+            } else {
+                null
+            }
+        )
+        bindSceneDetailsExpanded(animate = false)
+    }
+
+    private fun setSceneCoreStatus(text: String, colorRes: Int) {
+        setStatus(
+            binding.environmentDotSceneCore,
+            binding.environmentSceneCoreState,
+            text,
+            colorRes
+        )
+    }
+
+    private fun setSceneDetailStatus(inApps: Boolean?, inGames: Boolean?) {
+        fun bind(
+            dot: View,
+            label: android.widget.TextView,
+            button: View,
+            enabled: Boolean?
+        ) {
+            val text = when (enabled) {
+                true -> "已开启"
+                false -> "未开启"
+                null -> "未知"
+            }
+            val color = when (enabled) {
+                true -> R.color.status_warn
+                false -> R.color.status_ok
+                null -> R.color.status_off
+            }
+            setStatus(dot, label, text, color)
+            button.visibility = if (enabled == true) View.VISIBLE else View.GONE
+            button.isEnabled = !sceneActionInFlight
+            button.alpha = if (sceneActionInFlight) 0.55f else 1f
+        }
+        bind(
+            binding.environmentDotSceneApps,
+            binding.environmentSceneAppsState,
+            binding.environmentSceneAppsClose,
+            inApps
+        )
+        bind(
+            binding.environmentDotSceneGames,
+            binding.environmentSceneGamesState,
+            binding.environmentSceneGamesClose,
+            inGames
+        )
+    }
+
+    private fun disableSceneCoreAllocation(target: DaemonBridge.SceneCoreAllocationTarget) {
+        if (sceneActionInFlight) return
+        sceneActionInFlight = true
+        setSceneDetailStatus(lastSceneState?.inApps, lastSceneState?.inGames)
+        val currentViewGeneration = viewGeneration
+        val namespacePid = sceneNamespacePid
+        thread(name = "AppOptSceneCoreDisable") {
+            val result = DaemonBridge.disableSceneCoreAllocation(namespacePid, target)
+            runOnUiThread {
+                if (currentViewGeneration != viewGeneration || _binding == null ||
+                    isFinishing || isDestroyed) return@runOnUiThread
+                sceneActionInFlight = false
+                if (result.success) {
+                    bindSceneCoreAllocationState(
+                        lastSceneRoot,
+                        lastScenePendingUpdate,
+                        lastSceneCompatible,
+                        result.state
+                    )
+                    (activity as? MainActivity)?.onSceneCoreAllocationChanged(result.state)
+                    val label = when (target) {
+                        DaemonBridge.SceneCoreAllocationTarget.APPS -> "应用"
+                        DaemonBridge.SceneCoreAllocationTarget.GAMES -> "游戏"
+                    }
+                    toast("已关闭 Scene ${label}核心分配")
+                } else {
+                    setSceneDetailStatus(lastSceneState?.inApps, lastSceneState?.inGames)
+                    toast(result.error.ifBlank { "关闭 Scene 核心分配失败" })
+                }
+            }
+        }
+    }
+
+    private fun bindSceneDetailsExpanded(animate: Boolean) {
+        val expanded = sceneDetailsExpanded && binding.environmentSceneSection.visibility == View.VISIBLE
+        binding.environmentSceneCoreDetails.visibility = if (expanded) View.VISIBLE else View.GONE
+        binding.environmentSceneCoreArrow.contentDescription =
+            if (expanded) "收起 Scene 核心分配详情" else "展开 Scene 核心分配详情"
+        val rotation = if (expanded) 180f else 0f
+        if (animate) {
+            binding.environmentSceneCoreArrow.animate()
+                .rotation(rotation)
+                .setDuration(180L)
+                .start()
+        } else {
+            binding.environmentSceneCoreArrow.animate().cancel()
+            binding.environmentSceneCoreArrow.rotation = rotation
+        }
+    }
+
     private fun readForegroundState(): ForegroundSnapshot {
         var state = DaemonBridge.readTaskForegroundState()
         if (state.available) return ForegroundSnapshot(state, startRequested = false)
@@ -272,12 +465,34 @@ class EnvironmentFragment : TopLevelFragment() {
     }
 
     private fun requestOverlay() {
-        startActivity(
-            Intent(
-                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                Uri.parse("package:${requireContext().packageName}")
-            )
+        val context = requireContext()
+        val packageIntent = Intent(
+            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+            Uri.parse("package:${context.packageName}")
         )
+        try {
+            startActivity(packageIntent)
+        } catch (packageError: Exception) {
+            // 部分 ROM 不接受带 package URI 的悬浮窗页面，退回系统总开关页面。
+            try {
+                startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION))
+            } catch (genericError: Exception) {
+                try {
+                    startActivity(
+                        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                            data = Uri.parse("package:${context.packageName}")
+                        }
+                    )
+                } catch (detailsError: Exception) {
+                    android.util.Log.w(
+                        "AppOpt",
+                        "overlay settings intent unavailable",
+                        detailsError
+                    )
+                    AppToast.show(context, "请在系统设置中手动开启 AppOpt 悬浮窗权限")
+                }
+            }
+        }
     }
 
     private fun requestUsageAccess() {
@@ -414,11 +629,28 @@ class EnvironmentFragment : TopLevelFragment() {
     private fun showModuleUpdateDialog(update: ModuleUpdater.UpdateInfo) {
         setUpdateBusy(true)
         val currentViewGeneration = viewGeneration
-        ModuleUpdateDialog.show(requireActivity() as AppCompatActivity, update) {
+        val shown = ModuleUpdateDialog.show(requireActivity() as AppCompatActivity, update) {
             if (currentViewGeneration == viewGeneration && _binding != null) {
                 setUpdateBusy(false)
             }
         }
+        if (!shown && ModuleUpdateDialog.activeUpdate(requireActivity() as AppCompatActivity) == null) {
+            setUpdateBusy(false)
+        }
+    }
+
+    private fun bindActiveModuleUpdateSessionIfNeeded() {
+        val activity = requireActivity() as AppCompatActivity
+        val update = ModuleUpdateDialog.activeUpdate(activity) ?: return
+        updateCheckStarted = true
+        cachedUpdateInfo = update
+        cachedUpdateResult = ModuleUpdater.CheckResult.UpdateAvailable(update)
+        bindUpdateResult(cachedUpdateResult!!)
+        setUpdateBusy(true)
+    }
+
+    fun onModuleUpdateSessionDismissed() {
+        if (_binding != null) setUpdateBusy(false)
     }
 
     private fun setUpdateStatus(text: String) {
@@ -435,6 +667,7 @@ class EnvironmentFragment : TopLevelFragment() {
         refreshInFlight = false
         refreshPending = false
         diagnosticBusy = false
+        sceneActionInFlight = false
         _binding = null
         super.onDestroyView()
     }

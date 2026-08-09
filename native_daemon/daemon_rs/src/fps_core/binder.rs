@@ -19,7 +19,12 @@
             let path = CString::new("/dev/binder").map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "invalid binder device path")
             })?;
-            let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+            let fd = unsafe {
+                libc::open(
+                    path.as_ptr(),
+                    libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                )
+            };
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -88,27 +93,23 @@
             }
             let read_fd = pfd[0];
             let write_fd = pfd[1];
-
-            let reader = thread::spawn(move || {
-                let mut out = Vec::with_capacity(64 * 1024);
-                let mut buf = [0u8; 4096];
-                loop {
-                    let rc = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
-                    if rc > 0 {
-                        out.extend_from_slice(&buf[..rc as usize]);
-                    } else if rc == 0 {
-                        break;
-                    } else {
-                        let err = io::Error::last_os_error();
-                        if err.kind() == io::ErrorKind::Interrupted {
-                            continue;
-                        }
-                        break;
-                    }
-                }
+            if let Err(err) = set_fd_nonblocking(read_fd) {
                 close_fd(read_fd);
-                out
-            });
+                close_fd(write_fd);
+                return Err(err);
+            }
+
+            let reader = match thread::Builder::new()
+                .name("AppOptSfBinder".to_string())
+                .spawn(move || read_binder_dump_pipe(read_fd))
+            {
+                Ok(reader) => reader,
+                Err(err) => {
+                    close_fd(read_fd);
+                    close_fd(write_fd);
+                    return Err(err);
+                }
+            };
 
             let result = (|| {
                 let mut parcel = Parcel::with_capacity(1024);
@@ -128,11 +129,14 @@
             })();
 
             close_fd(write_fd);
-            let output = reader.join().unwrap_or_default();
+            let output = reader.join().map_err(|_| {
+                io::Error::new(io::ErrorKind::Other, "SurfaceFlinger dump reader panicked")
+            })?;
             if let Err(err) = result {
                 self.have_sf = false;
                 return Err(err);
             }
+            let output = output?;
             Ok(String::from_utf8_lossy(&output).into_owned())
         }
 
@@ -195,20 +199,24 @@
             push_u32(&mut write_buf, BC_TRANSACTION);
             push_struct(&mut write_buf, &tr);
 
-            let mut wrote = false;
+            let deadline = Instant::now() + BINDER_TRANSACTION_TIMEOUT;
+            let mut write_offset = 0usize;
             let mut read_buf = [0u8; 4096];
-            for _ in 0..64 {
+            loop {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "binder transaction timed out",
+                    ));
+                }
+                let write_remaining = write_buf.len().saturating_sub(write_offset);
                 let mut bwr = BinderWriteRead {
-                    write_size: if wrote {
-                        0
-                    } else {
-                        write_buf.len() as BinderSize
-                    },
+                    write_size: write_remaining as BinderSize,
                     write_consumed: 0,
-                    write_buffer: if wrote {
+                    write_buffer: if write_remaining == 0 {
                         0
                     } else {
-                        write_buf.as_ptr() as BinderUintPtr
+                        (unsafe { write_buf.as_ptr().add(write_offset) }) as BinderUintPtr
                     },
                     read_size: read_buf.len() as BinderSize,
                     read_consumed: 0,
@@ -217,18 +225,39 @@
                 let rc = unsafe {
                     libc::ioctl(self.fd, BINDER_WRITE_READ, &mut bwr as *mut BinderWriteRead)
                 };
+                let wrote = bwr.write_consumed as usize;
+                if wrote > write_remaining {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "binder reported invalid write_consumed",
+                    ));
+                }
+                write_offset = write_offset.saturating_add(wrote);
+                let read_consumed = bwr.read_consumed as usize;
+                if read_consumed > read_buf.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "binder reported invalid read_consumed",
+                    ));
+                }
                 if rc < 0 {
                     let err = io::Error::last_os_error();
                     if err.kind() == io::ErrorKind::Interrupted {
                         continue;
                     }
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        let events = if write_offset >= write_buf.len() {
+                            libc::POLLIN
+                        } else {
+                            libc::POLLIN | libc::POLLOUT
+                        };
+                        let _ = poll_fd_until(self.fd, events, deadline, false)?;
+                        continue;
+                    }
                     return Err(err);
                 }
-                if bwr.write_consumed >= write_buf.len() as BinderSize {
-                    wrote = true;
-                }
                 if let Some(reply) =
-                    self.parse_binder_read(&read_buf[..bwr.read_consumed as usize], reply_cap)?
+                    self.parse_binder_read(&read_buf[..read_consumed], reply_cap)?
                 {
                     if reply.status != 0 {
                         return Err(io::Error::new(
@@ -238,11 +267,15 @@
                     }
                     return Ok(reply);
                 }
+                if wrote == 0 && read_consumed == 0 {
+                    let events = if write_offset >= write_buf.len() {
+                        libc::POLLIN
+                    } else {
+                        libc::POLLIN | libc::POLLOUT
+                    };
+                    let _ = poll_fd_until(self.fd, events, deadline, false)?;
+                }
             }
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "binder transaction timed out",
-            ))
         }
 
         fn parse_binder_read(
@@ -361,20 +394,51 @@
         }
 
         fn write_command(&mut self, cmd: &[u8]) -> io::Result<()> {
-            let mut bwr = BinderWriteRead {
-                write_size: cmd.len() as BinderSize,
-                write_consumed: 0,
-                write_buffer: cmd.as_ptr() as BinderUintPtr,
-                read_size: 0,
-                read_consumed: 0,
-                read_buffer: 0,
-            };
-            let rc = unsafe { libc::ioctl(self.fd, BINDER_WRITE_READ, &mut bwr) };
-            if rc < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
+            let deadline = Instant::now() + BINDER_TRANSACTION_TIMEOUT;
+            let mut offset = 0usize;
+            while offset < cmd.len() {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "binder command write timed out",
+                    ));
+                }
+                let remaining = cmd.len() - offset;
+                let mut bwr = BinderWriteRead {
+                    write_size: remaining as BinderSize,
+                    write_consumed: 0,
+                    write_buffer: (unsafe { cmd.as_ptr().add(offset) }) as BinderUintPtr,
+                    read_size: 0,
+                    read_consumed: 0,
+                    read_buffer: 0,
+                };
+                let rc = unsafe { libc::ioctl(self.fd, BINDER_WRITE_READ, &mut bwr) };
+                let wrote = bwr.write_consumed as usize;
+                if wrote > remaining {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "binder reported invalid command write_consumed",
+                    ));
+                }
+                if wrote > 0 {
+                    offset += wrote;
+                }
+                if rc < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        let _ = poll_fd_until(self.fd, libc::POLLOUT, deadline, false)?;
+                        continue;
+                    }
+                    return Err(err);
+                }
+                if wrote == 0 {
+                    let _ = poll_fd_until(self.fd, libc::POLLOUT, deadline, false)?;
+                }
             }
+            Ok(())
         }
     }
 
@@ -388,6 +452,105 @@
             if self.fd >= 0 {
                 close_fd(self.fd);
             }
+        }
+    }
+
+    fn set_fd_nonblocking(fd: i32) -> io::Result<()> {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn read_binder_dump_pipe(fd: i32) -> io::Result<Vec<u8>> {
+        let result = (|| {
+            let deadline = Instant::now() + BINDER_DUMP_READER_TIMEOUT;
+            let mut out = Vec::with_capacity(BINDER_DUMP_MAX_OUTPUT.min(64 * 1024));
+            let mut buf = [0u8; 8192];
+            let mut truncated = false;
+            let mut peer_closed = false;
+            loop {
+                let rc = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if rc > 0 {
+                    let read = rc as usize;
+                    let remaining = BINDER_DUMP_MAX_OUTPUT.saturating_sub(out.len());
+                    out.extend_from_slice(&buf[..read.min(remaining)]);
+                    truncated |= read > remaining;
+                    continue;
+                }
+                if rc == 0 {
+                    break;
+                }
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if err.kind() != io::ErrorKind::WouldBlock {
+                    return Err(err);
+                }
+                if peer_closed {
+                    break;
+                }
+                let revents = poll_fd_until(fd, libc::POLLIN, deadline, true)?;
+                peer_closed |= revents & libc::POLLHUP != 0;
+            }
+            if truncated {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SurfaceFlinger dump exceeded 1 MiB",
+                ));
+            }
+            Ok(out)
+        })();
+        close_fd(fd);
+        result
+    }
+
+    fn poll_fd_until(
+        fd: i32,
+        events: i16,
+        deadline: Instant,
+        allow_hup: bool,
+    ) -> io::Result<i16> {
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "fd poll timed out"));
+            }
+            let timeout_ms = deadline
+                .saturating_duration_since(now)
+                .as_millis()
+                .saturating_add(1)
+                .min(i32::MAX as u128) as i32;
+            let mut poll_fd = libc::pollfd {
+                fd,
+                events,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if rc == 0 {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "fd poll timed out"));
+            }
+            if poll_fd.revents & (libc::POLLERR | libc::POLLNVAL) != 0
+                || (!allow_hup && poll_fd.revents & libc::POLLHUP != 0)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("fd poll failed: revents=0x{:x}", poll_fd.revents),
+                ));
+            }
+            return Ok(poll_fd.revents);
         }
     }
 
@@ -457,7 +620,13 @@
         status: i32,
     }
 
+    #[cfg(target_pointer_width = "32")]
+    type BinderSize = u32;
+    #[cfg(target_pointer_width = "64")]
     type BinderSize = u64;
+    #[cfg(target_pointer_width = "32")]
+    type BinderUintPtr = u32;
+    #[cfg(target_pointer_width = "64")]
     type BinderUintPtr = u64;
 
     #[repr(C)]
@@ -532,6 +701,19 @@
         cookie: BinderUintPtr,
     }
 
+    #[cfg(target_pointer_width = "32")]
+    const _: [(); 24] = [(); mem::size_of::<BinderWriteRead>()];
+    #[cfg(target_pointer_width = "64")]
+    const _: [(); 48] = [(); mem::size_of::<BinderWriteRead>()];
+    #[cfg(target_pointer_width = "32")]
+    const _: [(); 40] = [(); mem::size_of::<BinderTransactionData>()];
+    #[cfg(target_pointer_width = "64")]
+    const _: [(); 64] = [(); mem::size_of::<BinderTransactionData>()];
+    #[cfg(target_pointer_width = "32")]
+    const _: [(); 16] = [(); mem::size_of::<FlatBinderObject>()];
+    #[cfg(target_pointer_width = "64")]
+    const _: [(); 24] = [(); mem::size_of::<FlatBinderObject>()];
+
     fn push_struct<T>(out: &mut Vec<u8>, value: &T) {
         let bytes =
             unsafe { slice::from_raw_parts((value as *const T).cast::<u8>(), mem::size_of::<T>()) };
@@ -596,7 +778,13 @@
     }
 
     const B_TYPE_LARGE: u8 = 0x85;
+    #[cfg(target_pointer_width = "32")]
+    const BINDER_CURRENT_PROTOCOL_VERSION: i32 = 7;
+    #[cfg(target_pointer_width = "64")]
     const BINDER_CURRENT_PROTOCOL_VERSION: i32 = 8;
+    const BINDER_TRANSACTION_TIMEOUT: Duration = Duration::from_millis(1500);
+    const BINDER_DUMP_READER_TIMEOUT: Duration = Duration::from_millis(2000);
+    const BINDER_DUMP_MAX_OUTPUT: usize = 1 << 20;
     const BINDER_TYPE_HANDLE: u32 = b_pack_chars(b's', b'h', b'*', B_TYPE_LARGE);
     const BINDER_TYPE_WEAK_HANDLE: u32 = b_pack_chars(b'w', b'h', b'*', B_TYPE_LARGE);
     const BINDER_TYPE_FD: u32 = b_pack_chars(b'f', b'd', b'*', B_TYPE_LARGE);

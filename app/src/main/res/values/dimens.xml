@@ -9,4 +9,5 @@
     <dimen name="bottom_navigation_max_width">560dp</dimen>
     <dimen name="bottom_navigation_min_width">280dp</dimen>
     <dimen name="bottom_navigation_screen_margin">36dp</dimen>
+    <dimen name="bottom_navigation_scroll_gap">8dp</dimen>
 </resources>

@@ -15,6 +15,8 @@ import java.util.zip.ZipOutputStream
 
 object DiagnosticExporter {
 
+    private const val ROOT_RECORD_PREFIX = "__APPOPT_DIAG_V1__"
+
     fun export(context: Context): Result<String> = runCatching {
         val appContext = context.applicationContext
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
@@ -29,6 +31,7 @@ object DiagnosticExporter {
         val resolver = appContext.contentResolver
         val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
             ?: error("创建诊断包失败")
+        var finalFileName = fileName
 
         try {
             resolver.openOutputStream(uri)?.use { out ->
@@ -42,25 +45,13 @@ object DiagnosticExporter {
                     zip.addText("app/logcat_appopt.txt", readAppLogcat())
 
                     if (root) {
-                        zip.addRootFile("module/AppOpt.log", "/data/adb/modules/AppOpt/logs/AppOpt.log")
-                        zip.addRootFile("module/ForegroundHelper.log", "/data/adb/modules/AppOpt/logs/ForegroundHelper.log")
-                        zip.addRootFile("module/module.prop", "/data/adb/modules/AppOpt/module.prop")
-                        zip.addRootFile("module/pending_module.prop", "/data/adb/modules_update/AppOpt/module.prop")
-                        zip.addRootFile("config/applist.conf", "/data/adb/modules/AppOpt/config/applist.conf")
-                        zip.addRootFile("config/state/package_uid.map", "/data/adb/modules/AppOpt/config/state/package_uid.map")
-                        zip.addRootFile("config/state/rule_health.tsv", "/data/adb/modules/AppOpt/config/state/rule_health.tsv")
-                        zip.addRootFile("config/state/pid_cache.tsv", "/data/adb/modules/AppOpt/config/state/pid_cache.tsv")
-                        zip.addRootFile("config/calib_policy.conf", "/data/adb/modules/AppOpt/config/calib_policy.conf")
-                        zip.addRootFile("config/jank_boost.conf", "/data/adb/modules/AppOpt/config/jank_boost.conf")
-                        zip.addRootFile("config/boost.restore", "/data/adb/modules/AppOpt/config/boost.restore")
-                        zip.addRootFile("config/adaptive_governor.restore", "/data/adb/modules/AppOpt/config/adaptive_governor.restore")
-                        zip.addRootFile("config/foreground_task.state", "/data/adb/modules/AppOpt/config/foreground_task.state")
-                        zip.addRootFile("config/foreground_helper.pid", "/data/adb/modules/AppOpt/config/foreground_helper.pid")
-                        zip.addText("system/cpu_topology.txt", runRoot(CPU_TOPOLOGY_CMD, timeoutSeconds = 10L))
-                        zip.addText("system/cpuset.txt", runRoot(CPUSET_CMD, timeoutSeconds = 10L))
-                        zip.addText("system/processes.txt", runRoot(PROCESS_CMD, timeoutSeconds = 10L))
-                        zip.addText("fps/fps_status.txt", runRoot(FPS_CMD, timeoutSeconds = 10L))
-                        zip.addText("app/logcat_root_appopt.txt", runRoot(ROOT_LOGCAT_CMD, timeoutSeconds = 15L))
+                        val rootBundle = collectRootDiagnostics()
+                        rootBundle.entries.forEach { entry ->
+                            zip.addBytes(entry.name, entry.content)
+                        }
+                        if (rootBundle.error != null) {
+                            zip.addText("root_bundle_error.txt", rootBundle.error)
+                        }
                     } else {
                         zip.addText("root_unavailable.txt", "Root 权限不可用，未导出模块目录、系统 cpuset 和 root logcat。\n")
                     }
@@ -73,12 +64,21 @@ object DiagnosticExporter {
                 null,
                 null
             )
+            finalFileName = resolver.query(
+                uri,
+                arrayOf(MediaStore.Downloads.DISPLAY_NAME),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0) else null
+            }.orEmpty().ifBlank { fileName }
         } catch (e: Exception) {
             resolver.delete(uri, null, null)
             throw e
         }
 
-        "$relativeDir/$fileName"
+        "$relativeDir/$finalFileName"
     }
 
     private fun buildSummary(
@@ -145,7 +145,9 @@ object DiagnosticExporter {
                     BufferedReader(InputStreamReader(process.inputStream)).use { br ->
                         while (true) {
                             val line = br.readLine() ?: break
-                            out.appendLine(line)
+                            synchronized(out) {
+                                out.appendLine(line)
+                            }
                         }
                     }
                 } catch (_: Exception) {
@@ -155,35 +157,171 @@ object DiagnosticExporter {
                 start()
             }
             val finished = process.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
-            if (!finished) process.destroyForcibly()
+            if (!finished) {
+                process.destroyForcibly()
+                runCatching { process.inputStream.close() }
+                reader.interrupt()
+            }
             reader.join(1000)
-            out.toString()
+            synchronized(out) {
+                if (!finished) out.appendLine("[logcat 读取超时，以上为已收集内容]")
+                out.toString()
+            }
         } catch (e: Exception) {
             "执行失败: ${e.message}\n"
         }
     }
 
-    private fun runRoot(command: String, timeoutSeconds: Long): String {
-        val result = DaemonBridge.runRootCommand(command, timeoutSeconds)
-        return buildString {
-            append(result.output.ifBlank { "(无输出)\n" })
-            if (!result.success) {
-                appendLine()
-                appendLine("[命令执行失败或超时]")
+    private data class DiagnosticEntry(val name: String, val content: ByteArray)
+
+    private data class RootDiagnosticBundle(
+        val entries: List<DiagnosticEntry>,
+        val error: String? = null
+    )
+
+    private fun collectRootDiagnostics(): RootDiagnosticBundle {
+        val result = DaemonBridge.runRootCommand(buildRootBundleCommand(), timeoutSeconds = 45L)
+        val entries = linkedMapOf<String, DiagnosticEntry>()
+        result.output.lineSequence().forEach { line ->
+            if (!line.startsWith(ROOT_RECORD_PREFIX)) return@forEach
+            val parts = line.split('\t', limit = 4)
+            if (parts.size < 3) return@forEach
+            val name = parts[1].takeIf(::isSafeEntryName) ?: return@forEach
+            val content = when (parts[2]) {
+                "ok" -> runCatching {
+                    android.util.Base64.decode(parts.getOrElse(3) { "" }, android.util.Base64.DEFAULT)
+                }.getOrElse {
+                    "诊断数据解码失败。\n".toByteArray(Charsets.UTF_8)
+                }
+                else -> "读取失败或文件不存在。\n".toByteArray(Charsets.UTF_8)
+            }
+            entries[name] = DiagnosticEntry(name, content)
+        }
+        val error = if (result.success && entries.isNotEmpty()) {
+            null
+        } else {
+            buildString {
+                appendLine(
+                    if (result.timedOut) "Root 诊断收集整体超时。"
+                    else "Root 诊断收集未完整结束。"
+                )
+                if (result.output.isBlank()) appendLine("没有可用输出。")
             }
         }
+        return RootDiagnosticBundle(entries.values.toList(), error)
     }
 
-    private fun ZipOutputStream.addRootFile(entryName: String, path: String) {
-        val content = DaemonBridge.readRootFile(path)
-        addText(entryName, content ?: "读取失败或文件不存在: $path\n")
+    private fun isSafeEntryName(name: String): Boolean {
+        return name.isNotBlank() && !name.startsWith('/') &&
+            name.split('/').none { it.isBlank() || it == "." || it == ".." }
+    }
+
+    private fun ZipOutputStream.addBytes(entryName: String, content: ByteArray) {
+        putNextEntry(ZipEntry(entryName))
+        write(content)
+        closeEntry()
     }
 
     private fun ZipOutputStream.addText(entryName: String, text: String) {
-        putNextEntry(ZipEntry(entryName))
-        write(text.toByteArray(Charsets.UTF_8))
-        closeEntry()
+        addBytes(entryName, text.toByteArray(Charsets.UTF_8))
     }
+
+    private fun buildRootBundleCommand(): String = """
+        prefix='$ROOT_RECORD_PREFIX'
+        work="/data/local/tmp/.appopt_diag.${'$'}${'$'}"
+        rm -rf "${'$'}work"
+        mkdir -p "${'$'}work" || exit 2
+        command -v base64 >/dev/null 2>&1 || exit 3
+        trap 'rm -rf "${'$'}work"' EXIT HUP INT TERM
+        emit_file() {
+            local entry path max_bytes size source capped
+            entry=${'$'}1
+            path=${'$'}2
+            max_bytes=${'$'}{3:-0}
+            if [ -f "${'$'}path" ]; then
+                source=${'$'}path
+                case "${'$'}max_bytes" in
+                    ''|*[!0-9]*) max_bytes=0 ;;
+                esac
+                if [ "${'$'}max_bytes" -gt 0 ] 2>/dev/null; then
+                    size=${'$'}(wc -c < "${'$'}path" 2>/dev/null) || size=0
+                    case "${'$'}size" in
+                        ''|*[!0-9]*) size=0 ;;
+                    esac
+                    if [ "${'$'}size" -gt "${'$'}max_bytes" ] 2>/dev/null; then
+                        capped="${'$'}work/capped.${'$'}${'$'}.diag"
+                        printf '# AppOpt 诊断导出：原文件 %s 字节，仅保留末尾 %s 字节。\n' \
+                            "${'$'}size" "${'$'}max_bytes" > "${'$'}capped" || return
+                        tail -c "${'$'}max_bytes" "${'$'}path" >> "${'$'}capped" 2>/dev/null || return
+                        source=${'$'}capped
+                    fi
+                fi
+                printf '%s\t%s\tok\t' "${'$'}prefix" "${'$'}entry"
+                base64 < "${'$'}source" 2>/dev/null | tr -d '\r\n'
+                printf '\n'
+                [ "${'$'}source" = "${'$'}path" ] || rm -f "${'$'}source"
+            else
+                printf '%s\t%s\tmissing\t\n' "${'$'}prefix" "${'$'}entry"
+            fi
+        }
+
+        emit_file 'module/AppOpt.log' '/data/adb/modules/AppOpt/logs/AppOpt.log' 1572864
+        emit_file 'module/ForegroundHelper.log' '/data/adb/modules/AppOpt/logs/ForegroundHelper.log' 524288
+        emit_file 'module/module.prop' '/data/adb/modules/AppOpt/module.prop'
+        emit_file 'module/pending_module.prop' '/data/adb/modules_update/AppOpt/module.prop'
+        emit_file 'config/applist.conf' '/data/adb/modules/AppOpt/config/applist.conf'
+        emit_file 'config/state/package_uid.map' '/data/adb/modules/AppOpt/config/state/package_uid.map'
+        emit_file 'config/state/rule_health.tsv' '/data/adb/modules/AppOpt/config/state/rule_health.tsv'
+        emit_file 'config/state/pid_cache.tsv' '/data/adb/modules/AppOpt/config/state/pid_cache.tsv'
+        emit_file 'config/calib_policy.conf' '/data/adb/modules/AppOpt/config/calib_policy.conf'
+        emit_file 'config/jank_boost.conf' '/data/adb/modules/AppOpt/config/jank_boost.conf'
+        emit_file 'config/boost.restore' '/data/adb/modules/AppOpt/config/boost.restore'
+        emit_file 'config/adaptive_governor.restore' '/data/adb/modules/AppOpt/config/adaptive_governor.restore'
+        emit_file 'config/foreground_task.state' '/data/adb/modules/AppOpt/config/foreground_task.state'
+        emit_file 'config/foreground_helper.pid' '/data/adb/modules/AppOpt/config/foreground_helper.pid'
+
+        history_count=0
+        history_skipped=0
+        for history in /data/adb/modules/AppOpt/history/*.log \
+            /data/adb/modules/AppOpt/history/*.importing \
+            /data/adb/modules/AppOpt/history/*.appopt-importing \
+            /data/adb/modules/AppOpt/history/*.invalid.*; do
+            [ -f "${'$'}history" ] || continue
+            if [ "${'$'}history_count" -ge 8 ]; then
+                history_skipped=${'$'}((history_skipped + 1))
+                continue
+            fi
+            base=${'$'}{history##*/}
+            emit_file "history/${'$'}base" "${'$'}history" 262144
+            history_count=${'$'}((history_count + 1))
+        done
+        if [ "${'$'}history_skipped" -gt 0 ]; then
+            printf '为控制诊断包内存占用，另有 %s 个历史残留文件未导出。\n' \
+                "${'$'}history_skipped" > "${'$'}work/history_truncated.txt"
+            emit_file 'history/_truncated.txt' "${'$'}work/history_truncated.txt"
+        fi
+
+        (
+        $CPU_TOPOLOGY_CMD
+        ) > "${'$'}work/cpu_topology.txt" 2>&1
+        emit_file 'system/cpu_topology.txt' "${'$'}work/cpu_topology.txt"
+        (
+        $CPUSET_CMD
+        ) > "${'$'}work/cpuset.txt" 2>&1
+        emit_file 'system/cpuset.txt' "${'$'}work/cpuset.txt"
+        (
+        $PROCESS_CMD
+        ) > "${'$'}work/processes.txt" 2>&1
+        emit_file 'system/processes.txt' "${'$'}work/processes.txt"
+        (
+        $FPS_CMD
+        ) > "${'$'}work/fps_status.txt" 2>&1
+        emit_file 'fps/fps_status.txt' "${'$'}work/fps_status.txt"
+        (
+        $ROOT_LOGCAT_CMD
+        ) > "${'$'}work/logcat_root_appopt.txt" 2>&1
+        emit_file 'app/logcat_root_appopt.txt' "${'$'}work/logcat_root_appopt.txt" 1048576
+    """.trimIndent()
 
     private val CPU_TOPOLOGY_CMD = """
         echo '# uname'
@@ -234,7 +372,12 @@ object DiagnosticExporter {
             name="${'$'}1"
             found=$("${'$'}daemon_bin" --find-pid "${'$'}name" 2>/dev/null) || found=''
             if [ -z "${'$'}found" ]; then
-                found="${'$'}(pidof "${'$'}name" 2>/dev/null) ${'$'}(pgrep -x "${'$'}name" 2>/dev/null)"
+                for proc_dir in /proc/[0-9]*; do
+                    [ -r "${'$'}proc_dir/cmdline" ] || continue
+                    process_name=${'$'}(tr '\000' '\n' < "${'$'}proc_dir/cmdline" 2>/dev/null | head -n 1)
+                    [ "${'$'}process_name" = "${'$'}name" ] || continue
+                    found="${'$'}found ${'$'}{proc_dir##*/}"
+                done
             fi
             printf '%s\n' "${'$'}found"
         }

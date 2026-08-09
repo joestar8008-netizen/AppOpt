@@ -137,27 +137,14 @@ fn sync_policy_topology(topo: &CpuTiers) {
         return;
     };
 
-    let mut cleaned = Vec::new();
-    let mut in_block = false;
-    for raw in old.lines() {
-        let line = raw.trim();
-        if line == CALIB_TOPO_BEGIN {
-            in_block = true;
-            continue;
-        }
-        if in_block {
-            if line == CALIB_TOPO_END {
-                in_block = false;
-            }
-            continue;
-        }
-        if line.starts_with("detected_") || line.starts_with("# CPU 拓扑识别:") {
-            continue;
-        }
-        cleaned.push(raw);
-    }
+    let Some(cleaned) = policy_without_generated_topology(&old) else {
+        eprintln!(
+            "[CALIB] 检测到未闭合的 CPU 拓扑区块，已保留 calib_policy.conf 原内容"
+        );
+        return;
+    };
 
-    let mut next = cleaned.join("\n").trim_end().to_string();
+    let mut next = cleaned.trim_end().to_string();
     if !next.is_empty() {
         next.push('\n');
     }
@@ -199,5 +186,55 @@ fn sync_policy_topology(topo: &CpuTiers) {
         eprintln!("[CALIB] CPU 拓扑写入校准策略失败: {err}");
     } else {
         println!("[CALIB] CPU 拓扑已写入校准策略");
+    }
+}
+
+fn policy_without_generated_topology(old: &str) -> Option<String> {
+    let mut cleaned = Vec::new();
+    let mut in_block = false;
+    for raw in old.lines() {
+        let line = raw.trim();
+        if line == CALIB_TOPO_BEGIN {
+            if in_block {
+                return None;
+            }
+            in_block = true;
+            continue;
+        }
+        if in_block {
+            if line == CALIB_TOPO_END {
+                in_block = false;
+            }
+            continue;
+        }
+        if line.starts_with("detected_") || line.starts_with("# CPU 拓扑识别:") {
+            continue;
+        }
+        cleaned.push(raw);
+    }
+    (!in_block).then(|| cleaned.join("\n"))
+}
+
+#[cfg(test)]
+mod topology_policy_tests {
+    use super::*;
+
+    #[test]
+    fn closed_generated_block_is_removed_without_touching_surrounding_policy() {
+        let input = format!(
+            "version=1\n{CALIB_TOPO_BEGIN}\ndetected_all=0-7\n{CALIB_TOPO_END}\ncpuset_name=AppOptRs\n"
+        );
+        assert_eq!(
+            policy_without_generated_topology(&input).as_deref(),
+            Some("version=1\ncpuset_name=AppOptRs")
+        );
+    }
+
+    #[test]
+    fn unterminated_generated_block_is_never_rewritten() {
+        let input = format!(
+            "version=1\n{CALIB_TOPO_BEGIN}\ndetected_all=0-7\ncpuset_name=KeepMe\n"
+        );
+        assert_eq!(policy_without_generated_topology(&input), None);
     }
 }

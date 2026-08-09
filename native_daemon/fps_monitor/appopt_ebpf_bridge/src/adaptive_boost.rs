@@ -230,8 +230,14 @@ mod platform {
                 self.pid = pid;
                 return None;
             } else if self.pid > 0 && self.pid != pid {
+                // 同一包的实际出帧进程可能在主进程、渲染子进程之间切换。线程增强
+                // 必须按 PID 恢复并重新采样，但帧率基线属于包/显示档位，不能跟着
+                // 瞬时 PID 清空，否则多进程游戏会反复回到学习阶段。
                 self.restore();
-                self.reset_learning();
+                self.high_baseline_samples.clear();
+                self.low_baseline_samples.clear();
+                self.stopped_count = 0;
+                self.thread_sample = None;
                 self.pid = pid;
             } else if self.pid <= 0 {
                 self.pid = pid;

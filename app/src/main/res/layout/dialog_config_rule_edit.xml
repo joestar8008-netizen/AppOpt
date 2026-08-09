@@ -1,9 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:background="@drawable/bg_bottom_sheet_card"
+    android:fillViewport="true"
+    android:overScrollMode="never">
+
+<LinearLayout
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
     android:orientation="vertical"
     android:paddingStart="20dp"
     android:paddingTop="10dp"
@@ -126,27 +132,83 @@
             android:maxLines="1" />
     </com.google.android.material.textfield.TextInputLayout>
 
-    <com.google.android.material.textfield.TextInputLayout
-        android:id="@+id/ruleThreadBox"
-        style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+    <LinearLayout
+        android:id="@+id/ruleThreadArea"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="10dp"
-        android:hint="线程名称"
-        android:visibility="gone"
-        app:endIconContentDescription="从历史记录选择线程"
-        app:endIconDrawable="@drawable/ic_history"
-        app:endIconMode="custom">
+        android:layout_marginTop="12dp"
+        android:orientation="vertical"
+        android:visibility="gone">
 
-        <com.google.android.material.textfield.TextInputEditText
-            android:id="@+id/ruleThreadInput"
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:inputType="textNoSuggestions"
-            android:maxLines="1" />
-    </com.google.android.material.textfield.TextInputLayout>
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="线程规则"
+                    android:textColor="@color/text_primary"
+                    android:textSize="13sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="每个线程单独选择核心"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="11sp" />
+            </LinearLayout>
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/ruleThreadHistory"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="44dp"
+                android:minWidth="0dp"
+                android:text="历史多选"
+                android:textColor="@color/brand_primary_dark"
+                android:textSize="12sp"
+                app:icon="@drawable/ic_history"
+                app:iconPadding="5dp"
+                app:iconSize="18dp"
+                app:iconTint="@color/brand_primary_dark" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/ruleThreadGroups"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/ruleThreadAdd"
+            style="@style/Widget.Material3.Button.OutlinedButton"
+            android:layout_width="match_parent"
+            android:layout_height="44dp"
+            android:layout_marginTop="10dp"
+            android:text="添加线程"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp"
+            app:cornerRadius="8dp"
+            app:icon="@drawable/ic_add_plus"
+            app:iconPadding="6dp"
+            app:iconSize="18dp"
+            app:iconTint="@color/text_secondary"
+            app:strokeColor="@color/divider" />
+    </LinearLayout>
 
     <LinearLayout
+        android:id="@+id/ruleCpuHeader"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="16dp"
@@ -178,6 +240,7 @@
     </LinearLayout>
 
     <LinearLayout
+        android:id="@+id/ruleCpuGridContainer"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
@@ -248,3 +311,4 @@
             app:cornerRadius="10dp" />
     </LinearLayout>
 </LinearLayout>
+</androidx.core.widget.NestedScrollView>

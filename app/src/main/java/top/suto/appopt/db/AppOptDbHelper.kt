@@ -22,7 +22,11 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
 ) {
     companion object {
         private const val DATABASE_NAME = "appopt.db"
-        private const val DATABASE_VERSION = 5
+        private const val DATABASE_VERSION = 6
+        private const val RULE_HISTORY_RECENT_SESSIONS = 3
+        private const val RULE_HISTORY_ROW_LIMIT = 900
+        private const val MAX_SESSIONS_PER_PACKAGE = 30
+        private const val MAX_TOTAL_SESSIONS = 300
 
         // 表名
         private const val TABLE_SESSIONS = "sessions"
@@ -186,6 +190,10 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
                 "ALTER TABLE $TABLE_THREADS ADD COLUMN $COL_DETAILS TEXT NOT NULL DEFAULT ''"
             )
         }
+        if (oldVersion < 6) {
+            android.util.Log.d("AppOpt", "upgrade db v$oldVersion -> v$newVersion: add history picker indexes")
+            createIndexes(db)
+        }
     }
 
     /**
@@ -230,6 +238,13 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
                     }
                     val threadId = db.insert(TABLE_THREADS, null, threadValues)
                     check(threadId != -1L) { "insert thread failed: ${thread.name}" }
+                }
+                try {
+                    prunePackageHistory(db, pkg)
+                    pruneGlobalHistory(db)
+                } catch (error: Exception) {
+                    // 保留策略失败不能让本次完整校准记录随事务一起回滚。
+                    android.util.Log.w("AppOpt", "history retention failed after insert: $pkg", error)
                 }
                 db.setTransactionSuccessful()
                 true
@@ -344,29 +359,57 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
     /**
      * 读取规则编辑器需要的历史负载摘要，不读取和解压折线序列。
      */
-    fun getRuleHistoryRecordsByPackage(pkg: String): List<RuleHistoryRecord> {
+    fun getRuleHistoryRecordsByPackage(
+        pkg: String,
+        recentSessionLimit: Int = RULE_HISTORY_RECENT_SESSIONS,
+        rowLimit: Int = RULE_HISTORY_ROW_LIMIT
+    ): List<RuleHistoryRecord> {
+        val safeSessionLimit = recentSessionLimit.coerceIn(1, 10)
+        val safeRowLimit = rowLimit.coerceIn(1, 2_000)
+        val db = readableDatabase
+        val sessions = mutableListOf<Pair<Long, Long>>()
+        db.query(
+            TABLE_SESSIONS,
+            arrayOf(COL_SESSION_ID, COL_EPOCH),
+            "$COL_PKG = ?",
+            arrayOf(pkg),
+            null,
+            null,
+            "$COL_EPOCH DESC, $COL_SESSION_ID DESC",
+            safeSessionLimit.toString()
+        ).use { cursor ->
+            while (cursor.moveToNext()) sessions += cursor.getLong(0) to cursor.getLong(1)
+        }
+        if (sessions.isEmpty()) return emptyList()
+        val selectedSessions = sessions.take(safeRowLimit)
+
         val records = mutableListOf<RuleHistoryRecord>()
-        val cursor = readableDatabase.rawQuery(
-            """
-            SELECT s.$COL_EPOCH, t.$COL_NAME, t.$COL_AVG, t.$COL_MAX, t.$COL_DETAILS
-            FROM $TABLE_SESSIONS s
-            INNER JOIN $TABLE_THREADS t ON t.$COL_THREAD_SESSION_ID = s.$COL_SESSION_ID
-            WHERE s.$COL_PKG = ?
-            ORDER BY s.$COL_EPOCH DESC, s.$COL_SESSION_ID DESC, t.$COL_AVG DESC
-            """.trimIndent(),
-            arrayOf(pkg)
-        )
-        cursor.use {
-            while (it.moveToNext()) {
-                records.add(
-                    RuleHistoryRecord(
-                        epoch = it.getLong(0),
-                        name = it.getString(1),
-                        avg = it.getFloat(2),
-                        max = it.getFloat(3),
-                        details = it.getString(4)
+        val baseBudget = safeRowLimit / selectedSessions.size
+        var extraBudget = safeRowLimit % selectedSessions.size
+        selectedSessions.forEach { (sessionId, epoch) ->
+            val budget = baseBudget + if (extraBudget > 0) 1 else 0
+            if (extraBudget > 0) extraBudget--
+            db.query(
+                TABLE_THREADS,
+                arrayOf(COL_NAME, COL_AVG, COL_MAX, COL_DETAILS),
+                "$COL_THREAD_SESSION_ID = ?",
+                arrayOf(sessionId.toString()),
+                null,
+                null,
+                "$COL_AVG DESC, $COL_MAX DESC",
+                budget.coerceAtLeast(1).toString()
+            ).use { cursor ->
+                while (cursor.moveToNext()) {
+                    records.add(
+                        RuleHistoryRecord(
+                            epoch = epoch,
+                            name = cursor.getString(0),
+                            avg = cursor.getFloat(1),
+                            max = cursor.getFloat(2),
+                            details = cursor.getString(3)
+                        )
                     )
-                )
+                }
             }
         }
         return records
@@ -386,6 +429,38 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
     fun deleteAllSessionsByPackage(pkg: String): Int {
         val db = writableDatabase
         return db.delete(TABLE_SESSIONS, "$COL_PKG = ?", arrayOf(pkg))
+    }
+
+    /**
+     * 对已有数据库执行一次保留策略。每个应用保留最近 30 次，全局最多 300 次；
+     * threads 通过外键级联删除，避免长期校准后数据库无限增长。
+     */
+    fun pruneHistory(): Int {
+        val db = writableDatabase
+        db.beginTransaction()
+        return try {
+            val packages = mutableListOf<String>()
+            db.query(
+                true,
+                TABLE_SESSIONS,
+                arrayOf(COL_PKG),
+                null,
+                null,
+                null,
+                null,
+                null,
+                null
+            ).use { cursor ->
+                while (cursor.moveToNext()) packages += cursor.getString(0)
+            }
+            var deleted = 0
+            for (pkg in packages) deleted += prunePackageHistory(db, pkg)
+            deleted += pruneGlobalHistory(db)
+            db.setTransactionSuccessful()
+            deleted
+        } finally {
+            db.endTransaction()
+        }
     }
 
     /**
@@ -440,6 +515,39 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_pkg ON $TABLE_SESSIONS($COL_PKG)")
         db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_pkg_epoch ON $TABLE_SESSIONS($COL_PKG, $COL_EPOCH)")
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_session_id ON $TABLE_THREADS($COL_THREAD_SESSION_ID)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_sessions_pkg_epoch_desc ON $TABLE_SESSIONS($COL_PKG, $COL_EPOCH DESC)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_threads_session_avg ON $TABLE_THREADS($COL_THREAD_SESSION_ID, $COL_AVG DESC)")
+    }
+
+    private fun prunePackageHistory(db: SQLiteDatabase, pkg: String): Int {
+        return db.delete(
+            TABLE_SESSIONS,
+            """
+            $COL_PKG = ? AND $COL_SESSION_ID NOT IN (
+                SELECT $COL_SESSION_ID
+                FROM $TABLE_SESSIONS
+                WHERE $COL_PKG = ?
+                ORDER BY $COL_EPOCH DESC, $COL_SESSION_ID DESC
+                LIMIT $MAX_SESSIONS_PER_PACKAGE
+            )
+            """.trimIndent(),
+            arrayOf(pkg, pkg)
+        )
+    }
+
+    private fun pruneGlobalHistory(db: SQLiteDatabase): Int {
+        return db.delete(
+            TABLE_SESSIONS,
+            """
+            $COL_SESSION_ID NOT IN (
+                SELECT $COL_SESSION_ID
+                FROM $TABLE_SESSIONS
+                ORDER BY $COL_EPOCH DESC, $COL_SESSION_ID DESC
+                LIMIT $MAX_TOTAL_SESSIONS
+            )
+            """.trimIndent(),
+            null
+        )
     }
 
     /**

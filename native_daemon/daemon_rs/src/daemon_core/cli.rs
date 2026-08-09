@@ -3,8 +3,8 @@
 // --scan-once 只输出会命中的进程/线程和规则，不写 affinity，适合真机诊断。
 // --apply-once 会执行一次绑核后退出，适合排查某条规则是否能正常写入。
 //
-// 注意：这里故意直接调用 scan_proc 全量扫描，不使用 daemon 的 PID 缓存；调试命令要反映
-// 当前系统瞬时状态，而不是依赖上一轮缓存。
+// 注意：这里会先从当前 /proc 快照完整重建临时索引，再只扫描预筛出的目标 PID。
+// 临时索引不会写盘，调试结果仍反映当前系统状态，也避免重复枚举整个 /proc。
 fn run_once(args: &Args, apply: bool) -> io::Result<()> {
     let rules = parse_config(&args.config)?;
     let uid_map = parse_uid_map(&args.uid_map)?;
@@ -34,7 +34,19 @@ fn run_once(args: &Args, apply: bool) -> io::Result<()> {
         }
     );
 
-    let scan_result = scan_proc(&rules, &index, &BTreeSet::new())?;
+    // --scan-once/--apply-once 只使用本次快照，不依赖或改写常驻缓存。
+    let mut process_index = ProcessIndex {
+        loaded: true,
+        ..ProcessIndex::default()
+    };
+    let now_elapsed = elapsed_realtime_ms();
+    let _ = refresh_process_index(&mut process_index, now_elapsed, true)?;
+    let scan_result = scan_proc(
+        &rules,
+        &index,
+        &BTreeSet::new(),
+        &process_index,
+    )?;
     if !scan_result.complete {
         eprintln!("[RS] 本次扫描存在瞬时读取缺口，正向命中可用，不能用于健康负向结论");
     }
@@ -56,12 +68,15 @@ fn run_once(args: &Args, apply: bool) -> io::Result<()> {
         let mut managed_tids = HashMap::new();
         let stats = apply_hits(
             &hits,
-            true,
-            &args.cpuset_name,
             &mut managed_tids,
-            elapsed_realtime_ms(),
-            &BTreeSet::new(),
-            true,
+            ApplyPolicy {
+                detail_log: true,
+                cpuset_name: &args.cpuset_name,
+                now_elapsed: elapsed_realtime_ms(),
+                foreground_pids: &BTreeSet::new(),
+                interactive: true,
+                require_restore_baseline: false,
+            },
         );
         println!(
             "[RS] 执行汇总: 命中进程={} 已应用={} 已跳过={} 系统限制={} 失败={} 无效规则={} 被系统改写={}",

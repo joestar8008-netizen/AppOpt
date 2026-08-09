@@ -19,11 +19,27 @@
         probe_fail: u32,
         ts_mode: bool,
         ts_enabled: bool,
+        ts_owned: bool,
         ts_last: i64,
+        ts_last_source: Option<String>,
         ts_last_time: Option<Instant>,
+        ts_last_fps: f64,
+        ts_last_targeted: bool,
+        ts_layer_frames: Vec<(String, i64)>,
+        ts_selected_layer: Option<String>,
+        ts_global_reported: bool,
+        sample_targeted: bool,
         cli_mode: bool,
         cli_next: Option<Instant>,
         cli_last_error_log: Option<Instant>,
+        latency_next_probe: Option<Instant>,
+        latency_last_log: Option<Instant>,
+    }
+
+    struct TimestatsSample {
+        source: String,
+        frames: i64,
+        targeted: bool,
     }
 
     impl SfFallback {
@@ -46,15 +62,26 @@
                 probe_fail: 0,
                 ts_mode: cli_mode,
                 ts_enabled: false,
+                ts_owned: false,
                 ts_last: -1,
+                ts_last_source: None,
                 ts_last_time: None,
+                ts_last_fps: 0.0,
+                ts_last_targeted: false,
+                ts_layer_frames: Vec::new(),
+                ts_selected_layer: None,
+                ts_global_reported: false,
+                sample_targeted: false,
                 cli_mode,
                 cli_next: None,
                 cli_last_error_log: None,
+                latency_next_probe: None,
+                latency_last_log: None,
             })
         }
 
         fn poll(&mut self) -> f64 {
+            self.sample_targeted = false;
             if self.ts_mode {
                 return self.poll_timestats();
             }
@@ -71,11 +98,13 @@
                 return 0.0;
             }
             if fps >= 0.0 {
+                self.sample_targeted = true;
                 self.miss = 0;
                 self.probe_fail = 0;
                 return fps;
             }
             if valid > 0 && latency_ts_is_fresh(latest, now_monotonic_ns()) {
+                self.sample_targeted = true;
                 self.miss = 0;
                 self.probe_fail = 0;
                 return 0.0;
@@ -92,6 +121,11 @@
         fn discover_latency_layer(&mut self) -> f64 {
             // 遍历 SurfaceFlinger 图层，挑目标包名相关且 latency 数据最新的图层。
             // 如果 latency 完全拿不到有效数据，多次失败后切 timestats。
+            let now = Instant::now();
+            if self.latency_next_probe.is_some_and(|next| now < next) {
+                return 0.0;
+            }
+            self.latency_next_probe = None;
             let candidates = self.list_candidates();
             if self.cli_mode {
                 let _ = self.enable_timestats();
@@ -135,17 +169,22 @@
                 self.since = best_since;
                 self.miss = 0;
                 self.probe_fail = 0;
+                self.latency_next_probe = None;
+                self.sample_targeted = true;
                 return best_fps;
             }
 
+            self.probe_fail = self.probe_fail.saturating_add(1);
+            let should_log = self
+                .latency_last_log
+                .is_none_or(|last| now.duration_since(last) >= FPS_ERROR_LOG_INTERVAL);
             if valid_total == 0 {
-                self.probe_fail += 1;
-                if candidate_count == 0 {
+                if should_log && candidate_count == 0 {
                     println!(
                         "[Fallback] SurfaceFlinger latency 未找到匹配图层: pkg={} 失败={}/{}",
                         self.pkg, self.probe_fail, FPS_PROBE_FAIL
                     );
-                } else {
+                } else if should_log {
                     println!(
                         "[Fallback] SurfaceFlinger latency 候选图层无有效帧: pkg={} 候选={} [{}] 失败={}/{}",
                         self.pkg,
@@ -155,15 +194,25 @@
                         FPS_PROBE_FAIL
                     );
                 }
-                if self.probe_fail >= FPS_PROBE_FAIL {
-                    self.enable_timestats();
-                }
-            } else {
+            } else if should_log {
                 println!(
                     "[Fallback] SurfaceFlinger latency 有历史帧但不新鲜或不足: pkg={} 候选={} 有效帧={} [{}]",
                     self.pkg, candidate_count, valid_total, candidate_preview
                 );
-                self.probe_fail = 0;
+            }
+            if should_log {
+                self.latency_last_log = Some(now);
+            }
+
+            match super::latency_probe_delay(self.probe_fail) {
+                Some(delay) if !delay.is_zero() => {
+                    self.latency_next_probe = Some(now + delay);
+                }
+                Some(_) => {}
+                None => {
+                    self.latency_next_probe = None;
+                    let _ = self.enable_timestats();
+                }
             }
             0.0
         }
@@ -260,7 +309,8 @@
             if span_s <= 0.0 {
                 -1.0
             } else {
-                (new_frames.saturating_sub(1)) as f64 / span_s
+                super::valid_fps_sample((new_frames.saturating_sub(1)) as f64 / span_s)
+                    .unwrap_or(-1.0)
             }
         }
 
@@ -271,11 +321,36 @@
             }
             self.ts_mode = true;
             self.ts_last = -1;
+            self.ts_last_source = None;
             self.ts_last_time = None;
-            let enabled = self
-                .sf_dump(&["--timestats", "-enable", "-clear"], true)
-                .is_some();
+            self.ts_last_fps = 0.0;
+            self.ts_last_targeted = false;
+            self.ts_layer_frames.clear();
+            self.ts_selected_layer = None;
+            self.ts_global_reported = false;
+
+            // timestats 是 SurfaceFlinger 的全局状态。先探测是否已有其他工具启用；
+            // 已启用时只复用，既不清空统计，也不会在 AppOpt 结束时替对方关闭。
+            let already_enabled = self
+                .sf_dump(&["--timestats", "-dump"], true)
+                .is_some_and(|output| timestats_dump_is_active(&output));
+            if self.cli_mode {
+                // 控制命令不能被 1 秒采样限频挡住。
+                self.cli_next = None;
+            }
+            if already_enabled {
+                self.ts_enabled = true;
+                self.ts_owned = false;
+                println!(
+                    "[Fallback] 复用已启用的 SurfaceFlinger timestats ({})，不会清空或关闭",
+                    if self.cli_mode { "CLI" } else { "binder 直连" }
+                );
+                return true;
+            }
+
+            let enabled = self.sf_dump(&["--timestats", "-enable"], true).is_some();
             self.ts_enabled = enabled;
+            self.ts_owned = enabled;
             if enabled {
                 println!(
                     "[Fallback] 切换到 SurfaceFlinger timestats ({})",
@@ -289,52 +364,124 @@
             if !self.ts_enabled && !self.enable_timestats() {
                 return 0.0;
             }
-            let now_frames = self.timestats_frames();
-            if now_frames < 0 {
+            let Some(sample) = self.timestats_sample() else {
+                let cached = self
+                    .ts_last_time
+                    .filter(|last| last.elapsed() <= Duration::from_millis(2500))
+                    .map_or(0.0, |_| self.ts_last_fps);
+                self.sample_targeted = cached > 0.0 && self.ts_last_targeted;
+                return cached;
+            };
+            self.sample_targeted = sample.targeted;
+            let now_frames = sample.frames;
+            let now = Instant::now();
+            if self.ts_last >= 0 && self.ts_last_source.as_deref() != Some(sample.source.as_str()) {
+                // 图层或全局计数器切换时先重建差分基准，不能把两个独立累加器
+                // 相减生成一次虚假的高/低 FPS。
+                self.ts_last = now_frames;
+                self.ts_last_source = Some(sample.source);
+                self.ts_last_time = Some(now);
+                self.ts_last_fps = 0.0;
+                self.ts_last_targeted = self.sample_targeted;
                 return 0.0;
             }
-            let now = Instant::now();
             if self.ts_last >= 0 {
                 if let Some(last_time) = self.ts_last_time {
                     let dt = now.duration_since(last_time).as_secs_f64();
                     if dt > 0.0 && now_frames >= self.ts_last {
-                        let fps = (now_frames - self.ts_last) as f64 / dt;
+                        let raw_fps = (now_frames - self.ts_last) as f64 / dt;
                         self.ts_last = now_frames;
+                        self.ts_last_source = Some(sample.source);
                         self.ts_last_time = Some(now);
-                        return fps;
+                        if let Some(fps) = super::valid_fps_sample(raw_fps) {
+                            self.ts_last_fps = fps;
+                            self.ts_last_targeted = self.sample_targeted;
+                            return fps;
+                        }
+                        self.ts_last_fps = 0.0;
+                        self.ts_last_targeted = self.sample_targeted;
+                        return 0.0;
                     }
                 }
             }
             self.ts_last = now_frames;
+            self.ts_last_source = Some(sample.source);
             self.ts_last_time = Some(now);
+            self.ts_last_targeted = self.sample_targeted;
             0.0
         }
 
-        fn timestats_frames(&mut self) -> i64 {
+        fn timestats_sample(&mut self) -> Option<TimestatsSample> {
             let Some(out) = self.sf_dump(&["--timestats", "-dump"], true) else {
-                return -1;
+                return None;
             };
-            let mut best = -1i64;
-            let mut in_target = false;
+            let mut global = -1i64;
+            let mut target_layer: Option<String> = None;
+            let mut target_layers = Vec::<(String, i64)>::new();
+            let mut reached_layers = false;
             for line in out.lines() {
                 if line.contains("layerName") {
-                    in_target = layer_matches_pkg(line, &self.pkg);
+                    reached_layers = true;
+                    target_layer = layer_matches_pkg(line, &self.pkg)
+                        .then(|| timestats_layer_identity(line));
                     continue;
                 }
-                if !in_target {
-                    continue;
-                }
-                if let Some((_, value)) = line
-                    .split_once("totalFrames")
-                    .and_then(|(_, rest)| rest.split_once('='))
-                {
-                    if let Ok(frames) = value.trim().parse::<i64>() {
-                        best = best.max(frames);
+                if !reached_layers && line.trim_start().starts_with("totalFrames") {
+                    if let Some(frames) = parse_timestats_frames(line) {
+                        global = global.max(frames);
                     }
-                    in_target = false;
+                }
+                let Some(layer) = target_layer.as_ref() else {
+                    continue;
+                };
+                if let Some(frames) = parse_timestats_frames(line) {
+                    if let Some((_, current)) = target_layers
+                        .iter_mut()
+                        .find(|(name, _)| name == layer)
+                    {
+                        *current = (*current).max(frames);
+                    } else {
+                        target_layers.push((layer.clone(), frames));
+                    }
+                    target_layer = None;
                 }
             }
-            best
+
+            let selected = super::select_active_timestats_layer(
+                &self.ts_layer_frames,
+                &target_layers,
+                self.ts_selected_layer.as_deref(),
+            );
+            self.ts_layer_frames = target_layers;
+            if let Some(index) = selected {
+                let (source, frames) = self.ts_layer_frames[index].clone();
+                self.ts_selected_layer = Some(source.clone());
+                return Some(TimestatsSample {
+                    source,
+                    frames,
+                    targeted: true,
+                });
+            }
+            self.ts_selected_layer = None;
+            if self.cli_mode && global >= 0 {
+                if !self.ts_global_reported {
+                    println!(
+                        "[Fallback] CLI timestats 未提供目标应用图层，全局合成帧率仅供悬浮显示，不参与动态调度: pkg={}",
+                        self.pkg
+                    );
+                    self.ts_global_reported = true;
+                }
+                return Some(TimestatsSample {
+                    source: "__surfaceflinger_global__".to_string(),
+                    frames: global,
+                    targeted: false,
+                });
+            }
+            None
+        }
+
+        fn sample_is_targeted(&self) -> bool {
+            self.sample_targeted
         }
 
         fn sf_dump(&mut self, args: &[&str], allow_cli: bool) -> Option<String> {
@@ -354,9 +501,6 @@
                 self.binder = None;
                 self.cli_mode = true;
                 self.ts_mode = true;
-                self.ts_enabled = false;
-                self.ts_last = -1;
-                self.ts_last_time = None;
             }
             if !allow_cli {
                 return None;
@@ -393,6 +537,10 @@
         }
 
         fn disable_timestats(&mut self) {
+            if !self.ts_owned {
+                self.ts_enabled = false;
+                return;
+            }
             let args = ["--timestats", "-disable"];
             let binder_disabled = if self.cli_mode {
                 false
@@ -407,15 +555,60 @@
                 }
             }
             self.ts_enabled = false;
+            self.ts_owned = false;
         }
     }
 
     impl Drop for SfFallback {
         fn drop(&mut self) {
-            if self.ts_mode {
+            if self.ts_owned {
                 self.disable_timestats();
             }
         }
+    }
+
+    fn timestats_dump_is_active(output: &str) -> bool {
+        let lower = output.to_ascii_lowercase();
+        if lower.contains("timestats is disabled")
+            || lower.contains("time stats is disabled")
+            || lower.contains("enabled: false")
+            || lower.contains("enabled=false")
+        {
+            return false;
+        }
+        output.lines().any(|line| line.contains("layerName"))
+            && output
+                .lines()
+                .any(|line| parse_timestats_frames(line).is_some())
+    }
+
+    fn timestats_layer_identity(line: &str) -> String {
+        let value = line
+            .split_once('=')
+            .or_else(|| line.split_once(':'))
+            .map_or(line, |(_, value)| value)
+            .trim()
+            .trim_matches(|ch| matches!(ch, '"' | ',' | '{' | '}'))
+            .trim();
+        if value.is_empty() {
+            line.trim().to_string()
+        } else {
+            value.to_string()
+        }
+    }
+
+    fn parse_timestats_frames(line: &str) -> Option<i64> {
+        let (_, rest) = line.split_once("totalFrames")?;
+        let (_, value) = rest.split_once('=')?;
+        let digits = value
+            .trim_start()
+            .bytes()
+            .take_while(|byte| byte.is_ascii_digit())
+            .collect::<Vec<_>>();
+        if digits.is_empty() {
+            return None;
+        }
+        std::str::from_utf8(&digits).ok()?.parse::<i64>().ok()
     }
 
     fn sf_dump_cli_bounded(args: &[&str]) -> io::Result<String> {
@@ -431,20 +624,24 @@
         let mut stdout = child.stdout.take().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "dumpsys stdout unavailable")
         })?;
-        let reader = match thread::Builder::new()
+        let (reader_tx, reader_rx) = mpsc::sync_channel(1);
+        let _reader = match thread::Builder::new()
             .name("AppOptSfCli".to_string())
             .spawn(move || {
-                let mut output = Vec::with_capacity(MAX_OUTPUT.min(256 * 1024));
-                let mut chunk = [0u8; 8192];
-                loop {
-                    let read = stdout.read(&mut chunk)?;
-                    if read == 0 {
-                        break;
+                let result = (|| {
+                    let mut output = Vec::with_capacity(MAX_OUTPUT.min(256 * 1024));
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        let read = stdout.read(&mut chunk)?;
+                        if read == 0 {
+                            break;
+                        }
+                        let remaining = MAX_OUTPUT.saturating_sub(output.len());
+                        output.extend_from_slice(&chunk[..read.min(remaining)]);
                     }
-                    let remaining = MAX_OUTPUT.saturating_sub(output.len());
-                    output.extend_from_slice(&chunk[..read.min(remaining)]);
-                }
-                Ok::<Vec<u8>, io::Error>(output)
+                    Ok::<Vec<u8>, io::Error>(output)
+                })();
+                let _ = reader_tx.send(result);
             }) {
             Ok(reader) => reader,
             Err(err) => {
@@ -469,14 +666,18 @@
                 Err(err) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = reader.join();
                     return Err(err);
                 }
             }
         };
-        let output = reader.join().map_err(|_| {
-            io::Error::new(io::ErrorKind::Other, "dumpsys stdout reader panicked")
-        })??;
+        let output = reader_rx
+            .recv_timeout(Duration::from_millis(750))
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "dumpsys stdout reader did not close after process exit",
+                )
+            })??;
         if timed_out {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,

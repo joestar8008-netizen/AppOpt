@@ -4,6 +4,7 @@ import android.app.DownloadManager
 import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
@@ -11,30 +12,64 @@ import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileOutputStream
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import java.security.MessageDigest
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 import kotlin.concurrent.thread
 
 object ModuleUpdater {
+    private const val MODULE_DIR = "/data/adb/modules/AppOpt"
     private const val MODULE_PROP = "/data/adb/modules/AppOpt/module.prop"
+    private const val PENDING_MODULE_DIR = "/data/adb/modules_update/AppOpt"
     private const val PENDING_MODULE_PROP = "/data/adb/modules_update/AppOpt/module.prop"
     private const val CONNECT_TIMEOUT_MS = 10000
     private const val READ_TIMEOUT_MS = 15000
     private const val DOWNLOAD_CONNECT_TIMEOUT_MS = 15000
     private const val DOWNLOAD_READ_TIMEOUT_MS = 30000
     private const val INSTALL_TIMEOUT_SECONDS = 180L
+    private const val INSTALL_LOG_BATCH_MS = 200L
     private const val DOWNLOAD_TIMEOUT_MS = 30L * 60L * 1000L
     private const val DOWNLOAD_MISSING_LIMIT = 6
     private const val DOWNLOAD_PROVIDER_AUTHORITY = "downloads"
     private const val MAX_DOWNLOAD_REDIRECTS = 5
     private const val DOWNLOAD_BUFFER_SIZE = 64 * 1024
     private const val TAG = "AppOpt"
+    private const val UPDATE_PREFS = "appopt_module_update_state"
+    private const val KEY_DOWNLOAD_KEY = "download.key"
+    private const val KEY_DOWNLOAD_ID = "download.id"
+    private const val KEY_DOWNLOAD_TARGET = "download.target"
+    private const val KEY_DOWNLOAD_PHASE = "download.phase"
+    private const val KEY_DOWNLOAD_LOCAL_VERSION = "download.local_version"
+    private const val KEY_DOWNLOAD_LOCAL_VERSION_CODE = "download.local_version_code"
+    private const val KEY_DOWNLOAD_VERSION = "download.version"
+    private const val KEY_DOWNLOAD_VERSION_CODE = "download.version_code"
+    private const val KEY_DOWNLOAD_URL = "download.url"
+    private const val KEY_DOWNLOAD_PERCENT = "download.percent"
+    private const val KEY_DOWNLOAD_CHANGELOG = "download.changelog"
+    private const val KEY_INSTALL_AUTHORIZED = "download.install_authorized"
+    private const val KEY_INSTALL_KEY = "install.key"
+    private const val KEY_INSTALL_STATE = "install.state"
+    private const val KEY_INSTALL_UPDATED_AT = "install.updated_at"
+    private const val KEY_INSTALL_VERSION_CODE = "install.version_code"
+    private const val KEY_INSTALL_ZIP = "install.zip"
+    private const val INSTALL_STATE_RUNNING = "running"
+    private const val INSTALL_STATE_SUCCEEDED = "succeeded"
+    private const val INSTALL_STATE_FAILED = "failed"
+    private const val INSTALL_RUNNING_STALE_MS = (INSTALL_TIMEOUT_SECONDS + 60L) * 1000L
+    const val DOWNLOAD_PHASE_DOWNLOADING = "downloading"
+    const val DOWNLOAD_PHASE_READY = "ready"
+    const val DOWNLOAD_PHASE_MANUAL = "manual"
+    const val DOWNLOAD_PHASE_FAILED = "failed"
+    private val updateStateLock = Any()
     private const val IN_APP_UPDATE_ENV = "APPOPT_IN_APP_UPDATE"
     private const val IN_APP_UPDATE_MARKER_ENTRY = "config/app/.appopt_in_app_update"
     private const val IN_APP_UPDATE_FLAG_PATH = "/data/adb/appopt_in_app_update"
@@ -63,6 +98,22 @@ object ModuleUpdater {
         val changelogLoadFailed: Boolean
     )
 
+    /** 进程重建后恢复下载/等待刷入所需的最小状态。 */
+    data class PersistedDownloadSession(
+        val update: UpdateInfo,
+        val phase: String,
+        val targetPath: String?,
+        val percent: Int?,
+        val downloadId: Long?,
+        val installAuthorized: Boolean
+    )
+
+    enum class InstallClaim {
+        STARTED,
+        ALREADY_RUNNING,
+        PREVIOUSLY_FAILED
+    }
+
     sealed class CheckResult {
         data class UpdateAvailable(val update: UpdateInfo) : CheckResult()
         data class NoUpdate(
@@ -87,7 +138,9 @@ object ModuleUpdater {
         fun onFailure(message: String, recoverableZipPath: String?)
     }
 
-    class DownloadHandle internal constructor() {
+    class DownloadHandle internal constructor(
+        private val onCancel: (() -> Unit)? = null
+    ) {
         private val cancelled = AtomicBoolean(false)
         @Volatile private var artifact: File? = null
 
@@ -102,9 +155,15 @@ object ModuleUpdater {
             if (isCancelled) discardDownloadedModule(file.absolutePath)
         }
 
+        internal fun rejectArtifact() {
+            artifact?.let { discardDownloadedModule(it.absolutePath) }
+            artifact = null
+        }
+
         fun cancel() {
             cancelled.set(true)
             artifact?.let { discardDownloadedModule(it.absolutePath) }
+            onCancel?.invoke()
         }
     }
 
@@ -112,7 +171,7 @@ object ModuleUpdater {
         fun onProgress(message: String, percent: Int?)
         fun onLog(text: String) = Unit
         fun onSuccess(message: String)
-        fun onFailure(message: String)
+        fun onFailure(message: String, retainedZipPath: String? = null)
     }
 
     fun checkForUpdate(): CheckResult {
@@ -143,7 +202,9 @@ object ModuleUpdater {
 
         val pending = DaemonBridge.readRootFile(PENDING_MODULE_PROP)
             ?.let { parseModuleProp(it) }
-        if (pending != null && pending.versionCode >= remote.versionCode) {
+        if (pending != null && pending.versionCode >= remote.versionCode &&
+            pendingModuleIsComplete(pending.versionCode)
+        ) {
             return CheckResult.NoUpdate(
                 message = "新版本已刷入，重启后生效",
                 localVersion = local.version,
@@ -210,10 +271,33 @@ object ModuleUpdater {
     ): DownloadHandle {
         val appContext = context.applicationContext
         val mainHandler = Handler(Looper.getMainLooper())
-        val handle = DownloadHandle()
+        val handle = DownloadHandle {
+            cancelPersistedDownload(appContext, update)
+        }
+        persistDownloadPhase(
+            appContext,
+            update,
+            phase = DOWNLOAD_PHASE_DOWNLOADING,
+            targetPath = null,
+            percent = 0
+        )
+        var lastPersistedPercent: Int? = 0
+        var lastPersistedAt = SystemClock.elapsedRealtime()
 
         fun progress(message: String, percent: Int? = null) {
             if (!handle.isCancelled) {
+                val now = SystemClock.elapsedRealtime()
+                if (percent != lastPersistedPercent || now - lastPersistedAt >= 5_000L) {
+                    persistDownloadPhase(
+                        appContext,
+                        update,
+                        phase = DOWNLOAD_PHASE_DOWNLOADING,
+                        targetPath = null,
+                        percent = percent
+                    )
+                    lastPersistedPercent = percent
+                    lastPersistedAt = now
+                }
                 mainHandler.post {
                     if (!handle.isCancelled) callback.onProgress(message, percent)
                 }
@@ -237,10 +321,24 @@ object ModuleUpdater {
                 }
                 handle.track(zip)
                 if (handle.isCancelled) throw DownloadCancelledException()
+                try {
+                    validateModuleZip(zip, update)
+                } catch (e: UpdateException) {
+                    handle.rejectArtifact()
+                    clearPersistedDownload(appContext, update)
+                    throw e
+                }
                 val markedZip = markZipForInAppUpdate(zip)
                 handle.track(markedZip)
                 if (handle.isCancelled) throw DownloadCancelledException()
                 progress("下载完成，准备刷入", 100)
+                persistDownloadPhase(
+                    appContext,
+                    update,
+                    phase = DOWNLOAD_PHASE_READY,
+                    targetPath = markedZip.absolutePath,
+                    percent = 100
+                )
                 mainHandler.post {
                     if (!handle.isCancelled) callback.onSuccess(markedZip.absolutePath)
                 }
@@ -249,6 +347,13 @@ object ModuleUpdater {
             } catch (e: UpdateException) {
                 Log.e(TAG, "模块更新下载失败", e)
                 if (!handle.isCancelled) {
+                    persistDownloadPhase(
+                        appContext,
+                        update,
+                        phase = DOWNLOAD_PHASE_FAILED,
+                        targetPath = handle.artifactPath,
+                        percent = null
+                    )
                     mainHandler.post {
                         if (!handle.isCancelled) {
                             callback.onFailure(e.message ?: "更新失败", handle.artifactPath)
@@ -258,6 +363,13 @@ object ModuleUpdater {
             } catch (e: Exception) {
                 Log.e(TAG, "模块更新下载失败", e)
                 if (!handle.isCancelled) {
+                    persistDownloadPhase(
+                        appContext,
+                        update,
+                        phase = DOWNLOAD_PHASE_FAILED,
+                        targetPath = handle.artifactPath,
+                        percent = null
+                    )
                     mainHandler.post {
                         if (!handle.isCancelled) {
                             callback.onFailure("更新失败，请稍后重试", handle.artifactPath)
@@ -274,24 +386,68 @@ object ModuleUpdater {
         callback: InstallCallback,
         inAppUpdate: Boolean = true,
         prepareDelayMs: Long = 0L,
-        context: Context? = null
+        context: Context? = null,
+        expectedVersionCode: Int? = null
     ) {
         val mainHandler = Handler(Looper.getMainLooper())
+        val appContext = context?.applicationContext
 
         fun progress(message: String, percent: Int? = null) {
             mainHandler.post { callback.onProgress(message, percent) }
         }
 
+        val pendingLog = StringBuilder()
+        val pendingLogLock = Any()
+        var logPublishScheduled = false
+        fun drainPendingLog(): String = synchronized(pendingLogLock) {
+            pendingLog.toString().also { pendingLog.clear() }
+        }
+        val publishLogRunnable = Runnable {
+            synchronized(pendingLogLock) { logPublishScheduled = false }
+            drainPendingLog().takeIf { it.isNotEmpty() }?.let(callback::onLog)
+        }
         fun log(text: String) {
-            mainHandler.post { callback.onLog(text) }
+            if (text.isEmpty()) return
+            val shouldSchedule = synchronized(pendingLogLock) {
+                pendingLog.append(text)
+                if (logPublishScheduled) false else {
+                    logPublishScheduled = true
+                    true
+                }
+            }
+            if (shouldSchedule) mainHandler.postDelayed(publishLogRunnable, INSTALL_LOG_BATCH_MS)
+        }
+
+        fun flushLog() {
+            mainHandler.removeCallbacks(publishLogRunnable)
+            synchronized(pendingLogLock) { logPublishScheduled = false }
+            val chunk = drainPendingLog()
+            if (chunk.isNotEmpty()) mainHandler.post { callback.onLog(chunk) }
+        }
+
+        fun postSuccess(message: String) {
+            flushLog()
+            mainHandler.post { callback.onSuccess(message) }
+        }
+
+        fun postFailure(message: String, retainedZipPath: String? = null) {
+            flushLog()
+            mainHandler.post { callback.onFailure(message, retainedZipPath) }
         }
 
         var installZip: File? = null
-        fun installFailureMessage(message: String): String {
-            val zip = installZip?.takeIf { it.exists() } ?: return message
-            if (!inAppUpdate) return message
+        var claimedInstallKey: String? = null
+
+        fun markInstallFailed() {
+            val key = claimedInstallKey ?: return
+            appContext?.let { persistInstallState(it, key, INSTALL_STATE_FAILED) }
+        }
+
+        fun retainInstallFailure(message: String): Pair<String, String?> {
+            val zip = installZip?.takeIf { it.exists() } ?: return message to null
+            if (!inAppUpdate) return message to zip.absolutePath
             val manualZip = retainOriginalZipForManualInstall(context, zip, true, ::log)
-            return "$message\n模块已保存到：$manualZip\n请在 Root 管理器中手动刷入"
+            return "$message\n模块已保存到：$manualZip\n请在 Root 管理器中手动刷入" to manualZip
         }
 
         thread(name = "AppOptModuleInstaller") {
@@ -299,19 +455,58 @@ object ModuleUpdater {
                 val zip = File(zipPath)
                 installZip = zip
                 if (!zip.exists()) {
-                    mainHandler.post { callback.onFailure("模块 zip 不存在：$zipPath") }
+                    postFailure("模块 zip 不存在：$zipPath", null)
                     return@thread
+                }
+
+                val targetVersionCode = expectedVersionCode?.takeIf { it > 0 }
+                if (targetVersionCode != null) {
+                    try {
+                        validateModuleZip(zip, targetVersionCode)
+                    } catch (e: UpdateException) {
+                        throw InvalidModuleException(e.message ?: "模块 zip 校验失败")
+                    }
+                    if (pendingModuleIsComplete(targetVersionCode)) {
+                        appContext?.let { contextValue ->
+                            val key = installIdentity(zip, targetVersionCode)
+                            persistInstallState(contextValue, key, INSTALL_STATE_SUCCEEDED)
+                        }
+                        cleanupUpdateZips(zip, inAppUpdate, ::log)
+                        postSuccess("模块已刷入，重启后生效；App 将在重启后自动更新")
+                        return@thread
+                    }
+                }
+
+                if (appContext != null && targetVersionCode != null) {
+                    val key = installIdentity(zip, targetVersionCode)
+                    when (claimInstall(appContext, key, zip, targetVersionCode)) {
+                        InstallClaim.STARTED -> claimedInstallKey = key
+                        InstallClaim.ALREADY_RUNNING -> {
+                            postFailure(
+                                "检测到同一模块仍在刷入，已阻止重复执行 Root 安装命令",
+                                zip.absolutePath
+                            )
+                            return@thread
+                        }
+                        InstallClaim.PREVIOUSLY_FAILED -> {
+                            postFailure(
+                                "上次刷入流程已中断，已阻止页面重建后自动重复刷入；请返回更新页面重新确认",
+                                zip.absolutePath
+                            )
+                            return@thread
+                        }
+                    }
                 }
 
                 progress("正在检测模块管理器", null)
                 val manager = detectRootManager()
                 if (manager == null) {
+                    markInstallFailed()
                     val manualZip = retainOriginalZipForManualInstall(context, zip, inAppUpdate, ::log)
-                    mainHandler.post {
-                        callback.onFailure(
-                            "没有检测到可用的模块管理器\n模块已保存到：$manualZip\n请手动刷入"
-                        )
-                    }
+                    postFailure(
+                        "没有检测到可用的模块管理器\n模块已保存到：$manualZip\n请手动刷入",
+                        manualZip
+                    )
                     return@thread
                 }
 
@@ -344,34 +539,65 @@ object ModuleUpdater {
                         log(chunk)
                     }
                 }
-                if (result.success) {
+                val pendingReady = targetVersionCode?.let(::waitForPendingModuleUpdate)
+                    ?: (result.success && DaemonBridge.hasPendingModuleUpdate())
+                if (result.success && pendingReady) {
+                    claimedInstallKey?.let { key ->
+                        appContext?.let { persistInstallState(it, key, INSTALL_STATE_SUCCEEDED) }
+                    }
                     cleanupUpdateZips(zip, inAppUpdate, ::log)
                     val message = if (inAppUpdate) {
                         "模块已刷入，重启后生效；App 将在重启后自动更新"
                     } else {
                         "模块已刷入，重启后生效"
                     }
-                    mainHandler.post { callback.onSuccess(message) }
+                    postSuccess(message)
                 } else {
+                    markInstallFailed()
                     val manualZip = retainOriginalZipForManualInstall(context, zip, inAppUpdate, ::log)
-                    mainHandler.post {
-                        callback.onFailure(
-                            "刷入失败，原始模块已保存到：$manualZip\n请在 Root 管理器中手动刷入"
-                        )
+                    val reason = if (result.success) {
+                        "刷入命令已结束，但未检测到完整的待更新模块"
+                    } else if (result.timedOut) {
+                        "刷入超时，后台安装进程已终止"
+                    } else {
+                        "刷入失败"
                     }
+                    postFailure(
+                        "$reason，原始模块已保存到：$manualZip\n请在 Root 管理器中手动刷入",
+                        manualZip
+                    )
                 }
+            } catch (e: InvalidModuleException) {
+                markInstallFailed()
+                installZip?.takeIf(File::exists)?.let { discardDownloadedModule(it.absolutePath) }
+                postFailure(e.message ?: "模块 zip 校验失败", null)
             } catch (e: UpdateException) {
-                val message = installFailureMessage(e.message ?: "刷入失败")
-                mainHandler.post { callback.onFailure(message) }
+                markInstallFailed()
+                val (message, retainedPath) = retainInstallFailure(e.message ?: "刷入失败")
+                postFailure(message, retainedPath)
             } catch (_: Exception) {
-                val message = installFailureMessage("刷入失败")
-                mainHandler.post { callback.onFailure(message) }
+                markInstallFailed()
+                val (message, retainedPath) = retainInstallFailure("刷入失败")
+                postFailure(message, retainedPath)
             }
         }
     }
 
     fun detectRootManagerLabel(): String? {
         return detectRootManager()?.label
+    }
+
+    private fun waitForPendingModuleUpdate(expectedVersionCode: Int): Boolean {
+        repeat(20) {
+            if (pendingModuleIsComplete(expectedVersionCode)) return true
+            try {
+                Thread.sleep(250L)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+        }
+        return false
     }
 
     fun retainDownloadedModuleForManualInstall(
@@ -411,23 +637,31 @@ object ModuleUpdater {
         }
         val manager = context.getSystemService(DownloadManager::class.java)
             ?: throw SystemDownloadException("系统下载服务不可用")
-        val target = createDownloadTarget(context, update)
-        val request = DownloadManager.Request(Uri.parse(update.zipUrl))
-            .setTitle("AppOpt ${update.remoteVersion}")
-            .setDescription("正在下载模块更新")
-            .setMimeType("application/zip")
-            .setAllowedOverMetered(true)
-            .setAllowedOverRoaming(true)
-            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE)
-            .setDestinationUri(Uri.fromFile(target))
-
-        val id = try {
-            manager.enqueue(request)
-        } catch (e: RuntimeException) {
-            target.delete()
-            throw SystemDownloadException("系统下载服务无法创建任务", e)
+        var target = persistedDownloadTarget(context, update) ?: createDownloadTarget(context, update)
+        var id = persistedDownloadId(context, update)
+        var query: DownloadManager.Query
+        if (id == null || !downloadTaskExists(manager, id)) {
+            id?.let { runCatching { manager.remove(it) } }
+            clearPersistedDownloadTask(context, update)
+            target = createDownloadTarget(context, update)
+            val request = DownloadManager.Request(Uri.parse(update.zipUrl))
+                .setTitle("AppOpt ${update.remoteVersion}")
+                .setDescription("正在下载模块更新")
+                .setMimeType("application/zip")
+                .setAllowedOverMetered(true)
+                .setAllowedOverRoaming(true)
+                .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE)
+                .setDestinationUri(Uri.fromFile(target))
+            id = try {
+                manager.enqueue(request)
+            } catch (e: RuntimeException) {
+                target.delete()
+                throw SystemDownloadException("系统下载服务无法创建任务", e)
+            }
+            persistDownloadManagerTask(context, update, id, target)
         }
-        val query = DownloadManager.Query().setFilterById(id)
+        val activeId = id ?: throw SystemDownloadException("系统下载任务无效")
+        query = DownloadManager.Query().setFilterById(activeId)
         val startedAt = SystemClock.elapsedRealtime()
         var missingCount = 0
         try {
@@ -451,7 +685,7 @@ object ModuleUpdater {
                                 val completed = target.takeIf { it.exists() }
                                     ?: downloadedFile(cursor)
                                     ?: throw UpdateException("下载完成，但未找到模块文件")
-                                return preserveSuccessfulDownload(manager, id, completed)
+                                return preserveSuccessfulDownload(context, manager, activeId, completed)
                             }
                             DownloadManager.STATUS_FAILED -> {
                                 val reason = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))
@@ -481,8 +715,9 @@ object ModuleUpdater {
                 }
             }
         } catch (e: Exception) {
-            runCatching { manager.remove(id) }
+            runCatching { manager.remove(activeId) }
             target.delete()
+            clearPersistedDownloadTask(context, update)
             throw e
         }
     }
@@ -493,21 +728,40 @@ object ModuleUpdater {
         handle: DownloadHandle,
         onProgress: (String, Int?) -> Unit
     ): File {
-        val target = createDownloadTarget(context, update)
+        val target = persistedDownloadTarget(context, update) ?: createDownloadTarget(context, update)
         val partial = File(target.parentFile, "${target.name}.part")
         var connection: HttpURLConnection? = null
         val startedAt = SystemClock.elapsedRealtime()
+        var completed = false
 
         try {
-            connection = openDownloadConnection(update.zipUrl)
-            val total = connection.contentLengthLong.takeIf { it > 0L }
-            var downloaded = 0L
+            if (target.exists() && target.length() > 0L) {
+                return target
+            }
+            persistDownloadManagerTask(context, update, null, target)
+            val resumeOffset = partial.length().takeIf { it > 0L } ?: 0L
+            connection = try {
+                openDownloadConnection(update.zipUrl, resumeOffset)
+            } catch (e: Exception) {
+                if (resumeOffset > 0L) {
+                    partial.delete()
+                    openDownloadConnection(update.zipUrl, 0L)
+                } else {
+                    throw e
+                }
+            }
+            val append = resumeOffset > 0L && connection.responseCode == HttpURLConnection.HTTP_PARTIAL
+            val total = connection.contentLengthLong.takeIf { it > 0L }?.let {
+                if (append) it + resumeOffset else it
+            }
+            var downloaded = if (append) resumeOffset else 0L
             var lastPercent = -1
             var lastProgressAt = 0L
+            if (!append && partial.exists()) partial.delete()
             onProgress("内置下载中", if (total != null) 0 else null)
 
             connection.inputStream.buffered().use { input ->
-                partial.outputStream().buffered().use { output ->
+                FileOutputStream(partial, append).buffered().use { output ->
                     val buffer = ByteArray(DOWNLOAD_BUFFER_SIZE)
                     while (true) {
                         if (handle.isCancelled) throw DownloadCancelledException()
@@ -544,6 +798,8 @@ object ModuleUpdater {
                 partial.copyTo(target, overwrite = true)
                 partial.delete()
             }
+            completed = true
+            clearPersistedDownloadTask(context, update)
             return target.takeIf { it.exists() && it.length() > 0L }
                 ?: throw UpdateException("下载完成，但未找到模块文件")
         } catch (e: DownloadCancelledException) {
@@ -554,12 +810,12 @@ object ModuleUpdater {
             throw UpdateException("内置下载失败：${e.message ?: "网络连接异常"}", e)
         } finally {
             connection?.disconnect()
-            partial.delete()
+            if (completed || handle.isCancelled) partial.delete()
             if (!target.exists() || target.length() <= 0L) target.delete()
         }
     }
 
-    private fun openDownloadConnection(url: String): HttpURLConnection {
+    private fun openDownloadConnection(url: String, rangeStart: Long = 0L): HttpURLConnection {
         var currentUrl = URL(url)
         for (redirectCount in 0..MAX_DOWNLOAD_REDIRECTS) {
             val connection = (currentUrl.openConnection() as HttpURLConnection).apply {
@@ -568,6 +824,7 @@ object ModuleUpdater {
                 instanceFollowRedirects = false
                 setRequestProperty("User-Agent", "AppOpt/${DaemonBridge.REQUIRED_MODULE_VERSION_NAME}")
                 setRequestProperty("Accept", "application/zip, application/octet-stream, */*")
+                if (rangeStart > 0L) setRequestProperty("Range", "bytes=$rangeStart-")
             }
             val code = try {
                 connection.responseCode
@@ -603,7 +860,7 @@ object ModuleUpdater {
         }
         return File(
             dir,
-            "AppOpt-${safeFilePart(update.remoteVersion)}-${update.remoteVersionCode}-${System.currentTimeMillis()}.zip"
+            "AppOpt-${safeFilePart(update.remoteVersion)}-${update.remoteVersionCode}.zip"
         )
     }
 
@@ -624,6 +881,7 @@ object ModuleUpdater {
 
     /** DownloadManager.remove 会连同目标文件一起删除，先复制出 App 自己接管的 ZIP 再清理任务记录。 */
     private fun preserveSuccessfulDownload(
+        context: Context,
         manager: DownloadManager,
         id: Long,
         source: File
@@ -648,6 +906,7 @@ object ModuleUpdater {
             .onSuccess { removed ->
                 if (removed == 0) Log.w(TAG, "系统下载任务已完成但未能清理记录: $id")
             }
+        clearPersistedDownloadById(context, id)
         return preserved
     }
 
@@ -783,7 +1042,16 @@ object ModuleUpdater {
             values.clear()
             values.put(MediaStore.MediaColumns.IS_PENDING, 0)
             resolver.update(uri, values, null, null)
-            "/storage/emulated/0/${Environment.DIRECTORY_DOWNLOADS}/${source.name}"
+            val finalName = resolver.query(
+                uri,
+                arrayOf(MediaStore.MediaColumns.DISPLAY_NAME),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0) else null
+            }.orEmpty().ifBlank { source.name }
+            "/storage/emulated/0/${Environment.DIRECTORY_DOWNLOADS}/$finalName"
         } catch (_: Exception) {
             try {
                 resolver.delete(uri, null, null)
@@ -818,6 +1086,387 @@ object ModuleUpdater {
             index++
         }
         return target
+    }
+
+    private fun updateIdentity(update: UpdateInfo): String =
+        "${update.remoteVersionCode}|${update.zipUrl}"
+
+    private fun updatePreferences(context: Context) =
+        context.applicationContext.getSharedPreferences(UPDATE_PREFS, Context.MODE_PRIVATE)
+
+    private fun persistDownloadManagerTask(
+        context: Context,
+        update: UpdateInfo,
+        id: Long?,
+        target: File
+    ) {
+        val prefs = updatePreferences(context)
+        prefs.edit()
+            .putString(KEY_DOWNLOAD_KEY, updateIdentity(update))
+            .putLong(KEY_DOWNLOAD_ID, id ?: -1L)
+            .putString(KEY_DOWNLOAD_TARGET, target.absolutePath)
+            .putString(KEY_DOWNLOAD_PHASE, DOWNLOAD_PHASE_DOWNLOADING)
+            .putString(KEY_DOWNLOAD_VERSION, update.remoteVersion)
+            .putInt(KEY_DOWNLOAD_VERSION_CODE, update.remoteVersionCode)
+            .putString(KEY_DOWNLOAD_URL, update.zipUrl)
+            .commit()
+    }
+
+    fun persistDownloadPhase(
+        context: Context,
+        update: UpdateInfo,
+        phase: String,
+        targetPath: String?,
+        percent: Int?
+    ) {
+        val prefs = updatePreferences(context)
+        val editor = prefs.edit()
+            .putString(KEY_DOWNLOAD_KEY, updateIdentity(update))
+            .putString(KEY_DOWNLOAD_PHASE, phase)
+            .putString(KEY_DOWNLOAD_LOCAL_VERSION, update.localVersion)
+            .putInt(KEY_DOWNLOAD_LOCAL_VERSION_CODE, update.localVersionCode)
+            .putString(KEY_DOWNLOAD_VERSION, update.remoteVersion)
+            .putInt(KEY_DOWNLOAD_VERSION_CODE, update.remoteVersionCode)
+            .putString(KEY_DOWNLOAD_URL, update.zipUrl)
+            .putString(KEY_DOWNLOAD_CHANGELOG, update.changelogText)
+        if (targetPath != null) editor.putString(KEY_DOWNLOAD_TARGET, targetPath)
+        if (percent != null) editor.putInt(KEY_DOWNLOAD_PERCENT, percent)
+        else editor.remove(KEY_DOWNLOAD_PERCENT)
+        editor.commit()
+    }
+
+    fun readPersistedDownloadSession(context: Context): PersistedDownloadSession? {
+        val prefs = updatePreferences(context)
+        val key = prefs.getString(KEY_DOWNLOAD_KEY, null) ?: return null
+        val versionCode = prefs.getInt(KEY_DOWNLOAD_VERSION_CODE, -1).takeIf { it > 0 }
+            ?: return null
+        val url = prefs.getString(KEY_DOWNLOAD_URL, null).orEmpty().takeIf { it.isNotBlank() }
+            ?: return null
+        val version = prefs.getString(KEY_DOWNLOAD_VERSION, null).orEmpty()
+            .ifBlank { versionCode.toString() }
+        if (key != "$versionCode|$url") {
+            clearPersistedDownload(context, null)
+            return null
+        }
+        val target = prefs.getString(KEY_DOWNLOAD_TARGET, null)
+        val phase = prefs.getString(KEY_DOWNLOAD_PHASE, DOWNLOAD_PHASE_DOWNLOADING)
+            ?: DOWNLOAD_PHASE_DOWNLOADING
+        if (target.isNullOrBlank() && phase == DOWNLOAD_PHASE_READY) {
+            clearPersistedDownload(context, null)
+            return null
+        }
+        return PersistedDownloadSession(
+            update = UpdateInfo(
+                localVersion = prefs.getString(KEY_DOWNLOAD_LOCAL_VERSION, null).orEmpty()
+                    .ifBlank { "未知" },
+                localVersionCode = prefs.getInt(KEY_DOWNLOAD_LOCAL_VERSION_CODE, 0),
+                remoteVersion = version,
+                remoteVersionCode = versionCode,
+                zipUrl = url,
+                changelogUrl = null,
+                changelogText = prefs.getString(KEY_DOWNLOAD_CHANGELOG, "").orEmpty(),
+                changelogLoadFailed = false
+            ),
+            phase = phase,
+            targetPath = target,
+            percent = prefs.getInt(KEY_DOWNLOAD_PERCENT, -1).takeIf { it >= 0 },
+            downloadId = prefs.getLong(KEY_DOWNLOAD_ID, -1L).takeIf { it > 0L },
+            installAuthorized = prefs.getBoolean(KEY_INSTALL_AUTHORIZED, false)
+        )
+    }
+
+    /** 记录用户已明确确认“下载并刷入”，仅供恢复同一更新会话使用。 */
+    fun authorizeDownloadAndInstall(context: Context, update: UpdateInfo) {
+        updatePreferences(context).edit()
+            .putString(KEY_DOWNLOAD_KEY, updateIdentity(update))
+            .putString(KEY_DOWNLOAD_VERSION, update.remoteVersion)
+            .putString(KEY_DOWNLOAD_LOCAL_VERSION, update.localVersion)
+            .putInt(KEY_DOWNLOAD_LOCAL_VERSION_CODE, update.localVersionCode)
+            .putInt(KEY_DOWNLOAD_VERSION_CODE, update.remoteVersionCode)
+            .putString(KEY_DOWNLOAD_URL, update.zipUrl)
+            .putString(KEY_DOWNLOAD_CHANGELOG, update.changelogText)
+            .putBoolean(KEY_INSTALL_AUTHORIZED, true)
+            .commit()
+    }
+
+    fun clearPersistedDownload(context: Context, update: UpdateInfo? = null) {
+        val prefs = updatePreferences(context)
+        if (update != null && prefs.getString(KEY_DOWNLOAD_KEY, null) != updateIdentity(update)) {
+            return
+        }
+        prefs.edit()
+            .remove(KEY_DOWNLOAD_KEY)
+            .remove(KEY_DOWNLOAD_ID)
+            .remove(KEY_DOWNLOAD_TARGET)
+            .remove(KEY_DOWNLOAD_PHASE)
+            .remove(KEY_DOWNLOAD_LOCAL_VERSION)
+            .remove(KEY_DOWNLOAD_LOCAL_VERSION_CODE)
+            .remove(KEY_DOWNLOAD_VERSION)
+            .remove(KEY_DOWNLOAD_VERSION_CODE)
+            .remove(KEY_DOWNLOAD_URL)
+            .remove(KEY_DOWNLOAD_PERCENT)
+            .remove(KEY_DOWNLOAD_CHANGELOG)
+            .remove(KEY_INSTALL_AUTHORIZED)
+            .commit()
+    }
+
+    fun deleteDownloadArtifacts(context: Context, update: UpdateInfo) {
+        val dir = context.applicationContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+            ?: context.applicationContext.filesDir
+        val base = File(dir, "AppOpt-${safeFilePart(update.remoteVersion)}-${update.remoteVersionCode}.zip")
+        listOf(
+            base,
+            File(dir, "${base.name}.part"),
+            File(dir, "${base.nameWithoutExtension}-ready.zip"),
+            File(dir, "${base.nameWithoutExtension}-inapp.zip")
+        ).forEach { it.delete() }
+    }
+
+    fun cancelPersistedDownload(context: Context, update: UpdateInfo) {
+        val appContext = context.applicationContext
+        persistedDownloadId(appContext, update)?.let { id ->
+            appContext.getSystemService(DownloadManager::class.java)?.let { manager ->
+                runCatching { manager.remove(id) }
+            }
+        }
+        deleteDownloadArtifacts(appContext, update)
+        clearPersistedDownload(appContext, update)
+    }
+
+    private fun persistedDownloadId(context: Context, update: UpdateInfo): Long? {
+        val prefs = updatePreferences(context)
+        if (prefs.getString(KEY_DOWNLOAD_KEY, null) != updateIdentity(update)) return null
+        return prefs.getLong(KEY_DOWNLOAD_ID, -1L).takeIf { it > 0L }
+    }
+
+    private fun persistedDownloadTarget(context: Context, update: UpdateInfo): File? {
+        val prefs = updatePreferences(context)
+        if (prefs.getString(KEY_DOWNLOAD_KEY, null) != updateIdentity(update)) return null
+        return prefs.getString(KEY_DOWNLOAD_TARGET, null)?.let(::File)
+            ?.takeIf { it.parentFile?.canonicalPath ==
+                (context.applicationContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                    ?: context.applicationContext.filesDir).canonicalPath
+            }
+    }
+
+    private fun clearPersistedDownloadById(context: Context, id: Long) {
+        val prefs = updatePreferences(context)
+        if (prefs.getLong(KEY_DOWNLOAD_ID, -1L) == id) {
+            prefs.edit().remove(KEY_DOWNLOAD_ID).commit()
+        }
+    }
+
+    private fun clearPersistedDownloadTask(context: Context, update: UpdateInfo) {
+        val prefs = updatePreferences(context)
+        if (prefs.getString(KEY_DOWNLOAD_KEY, null) != updateIdentity(update)) return
+        prefs.edit()
+            .remove(KEY_DOWNLOAD_ID)
+            .remove(KEY_DOWNLOAD_TARGET)
+            .remove(KEY_DOWNLOAD_PERCENT)
+            .commit()
+    }
+
+    private fun downloadTaskExists(manager: DownloadManager, id: Long): Boolean {
+        val cursor = runCatching { manager.query(DownloadManager.Query().setFilterById(id)) }
+            .getOrNull() ?: return false
+        return cursor.use { it.moveToFirst() }
+    }
+
+    private fun installIdentity(zip: File, versionCode: Int): String =
+        sha256("$versionCode|${zip.canonicalPath}|${zip.length()}|${zip.lastModified()}")
+
+    private fun sha256(value: String): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(Locale.US, it.toInt() and 0xff) }
+    }
+
+    private fun claimInstall(
+        context: Context,
+        key: String,
+        zip: File,
+        versionCode: Int
+    ): InstallClaim {
+        synchronized(updateStateLock) {
+            val prefs = updatePreferences(context)
+            val currentKey = prefs.getString(KEY_INSTALL_KEY, null)
+            val currentState = prefs.getString(KEY_INSTALL_STATE, null)
+            val updatedAt = prefs.getLong(KEY_INSTALL_UPDATED_AT, 0L)
+            val runningFresh = currentState == INSTALL_STATE_RUNNING && updatedAt > 0L &&
+                System.currentTimeMillis().let { now ->
+                    now >= updatedAt && now - updatedAt < INSTALL_RUNNING_STALE_MS
+                }
+            if (currentKey == key) {
+                return when (currentState) {
+                    // 调用方已经先复核待更新目录；走到这里说明 journal 的成功状态
+                    // 已失去对应产物，不能再把它当作真实安装成功。
+                    INSTALL_STATE_SUCCEEDED -> InstallClaim.PREVIOUSLY_FAILED
+                    INSTALL_STATE_RUNNING -> if (runningFresh) {
+                        InstallClaim.ALREADY_RUNNING
+                    } else {
+                        InstallClaim.PREVIOUSLY_FAILED
+                    }
+                    INSTALL_STATE_FAILED -> InstallClaim.PREVIOUSLY_FAILED
+                    else -> InstallClaim.STARTED
+                }.also {
+                    if (it == InstallClaim.STARTED) {
+                        persistInstallStateLocked(prefs, key, INSTALL_STATE_RUNNING, zip, versionCode)
+                    }
+                }
+            }
+            if (runningFresh) return InstallClaim.ALREADY_RUNNING
+            persistInstallStateLocked(prefs, key, INSTALL_STATE_RUNNING, zip, versionCode)
+            return InstallClaim.STARTED
+        }
+    }
+
+    private fun persistInstallState(context: Context, key: String, state: String) {
+        synchronized(updateStateLock) {
+            persistInstallStateLocked(updatePreferences(context), key, state, null, null)
+        }
+    }
+
+    private fun persistInstallStateLocked(
+        prefs: android.content.SharedPreferences,
+        key: String,
+        state: String,
+        zip: File?,
+        versionCode: Int?
+    ) {
+        val editor = prefs.edit()
+            .putString(KEY_INSTALL_KEY, key)
+            .putString(KEY_INSTALL_STATE, state)
+            .putLong(KEY_INSTALL_UPDATED_AT, System.currentTimeMillis())
+        zip?.let { editor.putString(KEY_INSTALL_ZIP, it.absolutePath) }
+        versionCode?.let { editor.putInt(KEY_INSTALL_VERSION_CODE, it) }
+        editor.commit()
+    }
+
+    private fun pendingModuleIsComplete(expectedVersionCode: Int): Boolean {
+        val abi = runCatching(::currentAbiDirectory).getOrNull() ?: return false
+        val command = """
+            found=0
+            for dir in '$PENDING_MODULE_DIR' '$MODULE_DIR'; do
+                prop="${'$'}dir/module.prop"
+                id=${'$'}(sed -n 's/^id=//p' "${'$'}prop" 2>/dev/null | head -n 1)
+                code=${'$'}(sed -n 's/^versionCode=//p' "${'$'}prop" 2>/dev/null | head -n 1)
+                if [ -f "${'$'}prop" ] && [ "${'$'}id" = 'AppOpt' ] && [ "${'$'}code" = '$expectedVersionCode' ] &&
+                    [ -f "${'$'}dir/customize.sh" ] && [ -f "${'$'}dir/service.sh" ] &&
+                    [ -f "${'$'}dir/config/ebpf/cpu_util_monitor.bpf.o" ] &&
+                    [ -f "${'$'}dir/config/bin/$abi/AppOptRs" ] &&
+                    [ -f "${'$'}dir/config/ebpf/$abi/queuebuffer_probe.bpf.o" ] &&
+                    [ -f "${'$'}dir/config/ebpf/$abi/queuebuffer_probe_stats.bpf.o" ] &&
+                    [ -f "${'$'}dir/config/ebpf/$abi/queuebuffer_probe_perf.bpf.o" ]; then
+                    found=1
+                    break
+                fi
+            done
+            printf "${'$'}found"
+        """.trimIndent()
+        val result = DaemonBridge.runRootCommand(command)
+        return result.success && result.output.trim() == "1"
+    }
+
+    private fun validateModuleZip(zip: File, update: UpdateInfo) {
+        validateModuleZip(zip, update.remoteVersionCode, update.remoteVersion)
+    }
+
+    private fun validateModuleZip(zip: File, expectedVersionCode: Int) {
+        validateModuleZip(zip, expectedVersionCode, null)
+    }
+
+    private fun validateModuleZip(zip: File, expectedVersionCode: Int, expectedVersion: String?) {
+        if (!zip.exists() || zip.length() <= 0L) {
+            throw UpdateException("模块 zip 不存在或为空")
+        }
+        val required = linkedSetOf(
+            "module.prop",
+            "service.sh",
+            "customize.sh",
+            "META-INF/com/google/android/update-binary",
+            "META-INF/com/google/android/updater-script",
+            "config/ebpf/cpu_util_monitor.bpf.o"
+        )
+        val abi = currentAbiDirectory()
+        required += "config/bin/$abi/AppOptRs"
+        required += "config/ebpf/$abi/queuebuffer_probe.bpf.o"
+        required += "config/ebpf/$abi/queuebuffer_probe_stats.bpf.o"
+        required += "config/ebpf/$abi/queuebuffer_probe_perf.bpf.o"
+
+        var moduleProp: String? = null
+        val entries = linkedSetOf<String>()
+        try {
+            ZipInputStream(zip.inputStream().buffered()).use { input ->
+                while (true) {
+                    val entry = input.nextEntry ?: break
+                    val name = entry.name.replace('\\', '/').removePrefix("./")
+                    if (name.startsWith('/') || name.split('/').any { it == ".." }) {
+                        throw UpdateException("模块 zip 包含非法路径：${entry.name}")
+                    }
+                    if (!entry.isDirectory) {
+                        entries += name
+                        if (name == "module.prop") {
+                            if (entry.size > 128 * 1024L) {
+                                throw UpdateException("模块 zip 的 module.prop 过大")
+                            }
+                            moduleProp = readLimitedText(input, 128 * 1024)
+                        }
+                    }
+                    input.closeEntry()
+                }
+            }
+        } catch (e: UpdateException) {
+            throw e
+        } catch (e: Exception) {
+            throw UpdateException("模块 zip 无法读取：${e.message ?: "压缩包损坏"}", e)
+        }
+
+        val missing = required.filterNot(entries::contains)
+        if (missing.isNotEmpty()) {
+            throw UpdateException("模块 zip 缺少必要文件：${missing.joinToString(", ")}")
+        }
+        val props = moduleProp?.let(::parseProps)
+            ?: throw UpdateException("模块 zip 缺少 module.prop")
+        if (props["id"] != "AppOpt") {
+            throw UpdateException("模块 zip 的 id 不是 AppOpt")
+        }
+        val actualCode = props["versionCode"]?.toIntOrNull()
+            ?: throw UpdateException("模块 zip 的 versionCode 无效")
+        if (actualCode != expectedVersionCode) {
+            throw UpdateException(
+                "模块 zip 版本不匹配：目标 $expectedVersionCode，实际 $actualCode"
+            )
+        }
+        val expectedName = expectedVersion?.removePrefix("v")?.trim().orEmpty()
+        val actualName = props["version"]?.removePrefix("v")?.trim().orEmpty()
+        if (expectedName.isNotBlank() && actualName.isNotBlank() && expectedName != actualName) {
+            throw UpdateException("模块 zip 版本名称不匹配：目标 $expectedName，实际 $actualName")
+        }
+    }
+
+    private fun currentAbiDirectory(): String {
+        val abi = Build.SUPPORTED_ABIS.firstOrNull().orEmpty()
+        return when {
+            abi == "arm64-v8a" -> "arm64-v8a"
+            abi == "armeabi-v7a" || abi == "armeabi" -> "armeabi-v7a"
+            abi == "x86_64" -> "x86_64"
+            abi == "x86" -> "x86"
+            else -> throw UpdateException("不支持的设备 ABI：$abi")
+        }
+    }
+
+    /** API 31 没有可直接调用的 readNBytes；手动读取并限制 module.prop 大小。 */
+    private fun readLimitedText(input: InputStream, maxBytes: Int): String {
+        val out = ByteArrayOutputStream(minOf(maxBytes, 8192))
+        val buffer = ByteArray(8192)
+        var total = 0
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            total += count
+            if (total > maxBytes) throw UpdateException("模块 zip 的 module.prop 过大")
+            out.write(buffer, 0, count)
+        }
+        return out.toString(Charsets.UTF_8.name())
     }
 
     private fun downloadReason(reason: Int): String {
@@ -973,6 +1622,7 @@ object ModuleUpdater {
     }
 
     private class UpdateException(message: String, cause: Throwable? = null) : Exception(message, cause)
+    private class InvalidModuleException(message: String) : Exception(message)
     private class SystemDownloadException(message: String, cause: Throwable? = null) : Exception(message, cause)
     private class DownloadCancelledException : Exception()
 }

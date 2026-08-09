@@ -13,6 +13,7 @@
 /* BPF_MAP_TYPE 常量 */
 #define BPF_MAP_TYPE_RINGBUF 27
 #define BPF_MAP_TYPE_HASH 1
+#define BPF_MAP_TYPE_ARRAY 2
 #define BPF_ANY 0
 
 /* map 定义宏: __uint 是"数组长度"技巧, 内核 BPF loader 通过 sizeof 读属性 */
@@ -38,7 +39,8 @@ static void (*bpf_ringbuf_discard)(void *data, long long flags) = (void *)133;
 
 /* 输出到 trace_pipe(调试用) */
 static long (*bpf_trace_printk)(const char *fmt, unsigned long long fmt_size, ...) = (void *)6;
-static long (*bpf_probe_read_user)(void *dst, unsigned long long size, const void *unsafe_ptr) = (void *)112;
+/* helper 4 同时兼容旧 Android 内核；只用于 32 位 x86 compat 参数读取。 */
+static long (*bpf_probe_read_compat)(void *dst, unsigned long long size, const void *unsafe_ptr) = (void *)4;
 
 /* --- uprobe 参数读取 ---
  * queueBuffer 是 libgui 里的用户态函数，BPF 入口 ctx 实际是 struct pt_regs*。
@@ -122,7 +124,7 @@ static __always_inline unsigned long long appopt_read_parm1(void *ctx) {
     if (sp == 0) {
         return 0;
     }
-    if (bpf_probe_read_user(&value, sizeof(value), (const void *)(unsigned long long)(sp + 4)) != 0) {
+    if (bpf_probe_read_compat(&value, sizeof(value), (const void *)(unsigned long long)(sp + 4)) != 0) {
         return 0;
     }
     return (unsigned long long)value;
@@ -153,11 +155,36 @@ struct frame_stats_value {
     unsigned long long total_frames;
 };
 
+/* 仅允许用户态登记过的目标进程触发帧统计。
+ * 用户态为目标进程的线程挂载 uprobe，这里再按 TGID 过滤，避免进程切换期间接收旧目标事件。 */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(key_size, sizeof(unsigned int));
+    __uint(value_size, sizeof(unsigned int));
+    __uint(max_entries, 128);
+} target_tgids SEC(".maps");
+
 /* --- RingBuf map --- */
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 4096);         /* 4KB, 约可缓冲 170 个事件 */
 } events SEC(".maps");
+
+/* RingBuf 满时保留累计丢帧数，用户态限频报告，避免静默低估 FPS。 */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(key_size, sizeof(unsigned int));
+    __uint(value_size, sizeof(unsigned int));
+    __uint(max_entries, 1);
+} ringbuf_drops SEC(".maps");
+
+/* frame_stats 满时保留累计失败次数；事件后端仍会发送逐帧事件，避免静默低估。 */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(key_size, sizeof(unsigned int));
+    __uint(value_size, sizeof(unsigned int));
+    __uint(max_entries, 1);
+} frame_stats_drops SEC(".maps");
 
 /* --- 内核侧帧计数 map ---
  * PerfEvent 是 per-CPU 事件通道，用户态读取时可能乱序/丢样本。
@@ -193,7 +220,14 @@ static __always_inline int record_frame_stats(struct frame_event *event) {
     struct frame_stats_value initial = {};
     initial.last_ts = event->timestamp_ns;
     initial.total_frames = 1;
-    bpf_map_update_elem(&frame_stats, &key, &initial, BPF_ANY);
+    if (bpf_map_update_elem(&frame_stats, &key, &initial, BPF_ANY) != 0) {
+        unsigned int drop_key = 0;
+        unsigned int *drops = bpf_map_lookup_elem(&frame_stats_drops, &drop_key);
+        if (drops) {
+            __sync_fetch_and_add(drops, 1);
+        }
+        return -1;
+    }
     return 1;
 }
 
@@ -208,24 +242,33 @@ SEC("uprobe/libgui_queuebuffer")
 int on_queue_buffer(void *ctx) {
     struct frame_event local = {};
 
-    /* 记录帧事件 */
     unsigned long long pid_tgid = bpf_get_current_pid_tgid();
-    local.timestamp_ns = bpf_ktime_get_ns();
     local.pid = (unsigned int)(pid_tgid >> 32);
+    if (!bpf_map_lookup_elem(&target_tgids, &local.pid)) {
+        return 0;
+    }
+
+    /* 记录目标进程帧事件。 */
+    local.timestamp_ns = bpf_ktime_get_ns();
     local.tid = (unsigned int)pid_tgid;
 
     /* Surface/ANativeWindow 指针用于用户态按真实 Surface 分流。
      * 如果当前 ABI 未实现参数读取，会返回 0，用户态自动退回 TID 分流。 */
     local.surface_ptr = appopt_read_parm1(ctx);
 
-    if (!record_frame_stats(&local)) {
+    int stats_result = record_frame_stats(&local);
+    if (stats_result == 0) {
         return 0;
     }
 
     /* 在 RingBuf 预留空间(原子操作, 不阻塞) */
     struct frame_event *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
     if (!event) {
-        /* RingBuf 满: 丢弃本帧(极少发生, 且无损功能) */
+        unsigned int key = 0;
+        unsigned int *drops = bpf_map_lookup_elem(&ringbuf_drops, &key);
+        if (drops) {
+            __sync_fetch_and_add(drops, 1);
+        }
         return 0;
     }
     *event = local;

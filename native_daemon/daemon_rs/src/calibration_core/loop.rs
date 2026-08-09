@@ -22,6 +22,33 @@ pub fn start_calibration_thread(config_file: PathBuf) -> bool {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum CalibrationCommand {
+    Start(String),
+    Stop(Option<String>),
+}
+
+fn parse_calibration_command(command: &str) -> Option<CalibrationCommand> {
+    let command = command.trim();
+    let (kind, value) = command
+        .split_once(' ')
+        .map_or((command, ""), |(kind, value)| (kind, value.trim()));
+    let valid_pkg = |pkg: &str| {
+        !pkg.is_empty()
+            && pkg.len() <= 255
+            && pkg.contains('.')
+            && pkg
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':'))
+    };
+    match kind {
+        "start" if valid_pkg(value) => Some(CalibrationCommand::Start(value.to_string())),
+        "stop" if value.is_empty() => Some(CalibrationCommand::Stop(None)),
+        "stop" if valid_pkg(value) => Some(CalibrationCommand::Stop(Some(value.to_string()))),
+        _ => None,
+    }
+}
+
 fn calibration_loop(config_file: PathBuf) -> io::Result<()> {
     if let Err(err) = fs::create_dir_all(CONFIG_DIR) {
         eprintln!("[CALIB] 初始化配置目录失败，将在后续命令中重试: {err}");
@@ -35,6 +62,7 @@ fn calibration_loop(config_file: PathBuf) -> io::Result<()> {
 
     let mut session: Option<CalibSession> = None;
     let mut last_command_error_log: Option<Instant> = None;
+    let mut last_progress_log_round: Option<usize> = None;
     loop {
         // App 通过写 calibrate.cmd 控制开始/停止。
         // daemon 侧不直接和 Activity 通信，避免 App 被杀时校准线程状态丢失。
@@ -54,33 +82,84 @@ fn calibration_loop(config_file: PathBuf) -> io::Result<()> {
                 None
             }
         };
-        if let Some(cmd) = command {
-            if let Some(pkg) = cmd.strip_prefix("start ").map(str::trim) {
-                if !pkg.is_empty() {
-                    let processes = collect_pkg_processes(pkg);
-                    if processes.is_empty() {
-                        println!("[CALIB] 忽略开始命令: {pkg} 没有运行中的进程");
-                    } else {
-                        println!(
-                            "[CALIB] 开始采样: pkg={} 进程数={} 进程=[{}]",
-                            pkg,
-                            processes.len(),
-                            process_preview(&processes, 8)
-                        );
-                        match write_state(&format!("sampling {pkg}")) {
-                            Ok(()) => {
-                                session = Some(CalibSession::new(pkg.to_string(), processes));
+        if let Some(cmd) = command.and_then(|command| parse_calibration_command(&command)) {
+            match cmd {
+                CalibrationCommand::Start(pkg) => {
+                    if let Some(active) = session.as_ref() {
+                        if active.pkg == pkg {
+                            println!("[CALIB] 已在采样，忽略重复开始命令: {pkg}");
+                            if let Err(err) = write_state(&format!("sampling {pkg}")) {
+                                eprintln!("[CALIB] 重复开始命令确认状态写入失败: {err}");
                             }
-                            Err(err) => {
-                                eprintln!("[CALIB] 采样状态写入失败，忽略本次开始命令: {err}");
+                        } else {
+                            println!(
+                                "[CALIB] 忽略开始命令: requested={} active={} reason=busy",
+                                pkg, active.pkg
+                            );
+                            if let Err(err) = write_state(&format!(
+                                "sampling {};reason=busy;requested={pkg}", active.pkg
+                            )) {
+                                eprintln!("[CALIB] 忙碌状态写入失败: {err}");
+                            }
+                        }
+                    } else {
+                        let processes = collect_pkg_processes(&pkg);
+                        if processes.is_empty() {
+                            println!("[CALIB] 忽略开始命令: {pkg} 没有运行中的进程");
+                            if let Err(err) =
+                                write_state(&format!("rejected {pkg};reason=no_process"))
+                            {
+                                eprintln!("[CALIB] 拒绝状态写入失败: {err}");
+                            }
+                        } else {
+                            println!(
+                                "[CALIB] 开始采样: pkg={} 进程数={} 进程=[{}]",
+                                pkg,
+                                processes.len(),
+                                process_preview(&processes, 8)
+                            );
+                            match write_state(&format!("sampling {pkg}")) {
+                                Ok(()) => {
+                                    session = Some(CalibSession::new(pkg.clone(), processes));
+                                    last_progress_log_round = None;
+                                }
+                                Err(err) => {
+                                    eprintln!(
+                                        "[CALIB] 采样状态写入失败，忽略本次开始命令: {err}"
+                                    );
+                                }
                             }
                         }
                     }
                 }
-            } else if cmd == "stop" || cmd.starts_with("stop ") {
-                if let Some(done) = session.take() {
-                    if let Err(err) = finish_session(done, &config_file) {
-                        eprintln!("[CALIB] 校准收尾失败，后台线程将继续运行: {err}");
+                CalibrationCommand::Stop(requested) => {
+                    let matches_active = session.as_ref().is_some_and(|active| {
+                        requested.as_deref().is_none_or(|pkg| pkg == active.pkg)
+                    });
+                    if matches_active {
+                        if let Some(done) = session.take() {
+                            if let Err(err) = finish_session(done, &config_file) {
+                                eprintln!("[CALIB] 校准收尾失败，后台线程将继续运行: {err}");
+                            }
+                        }
+                    } else if let Some(active) = session.as_ref() {
+                        let requested = requested.as_deref().unwrap_or_default();
+                        println!(
+                            "[CALIB] 忽略不属于当前会话的停止命令: requested={} active={}",
+                            requested, active.pkg
+                        );
+                        if let Err(err) = write_state(&format!(
+                            "sampling {};reason=stop_mismatch;requested={requested}", active.pkg
+                        )) {
+                            eprintln!("[CALIB] 停止命令不匹配状态写入失败: {err}");
+                        }
+                    } else if let Some(pkg) = requested {
+                        // App 可能在 daemon 已自动收尾后补发 stop。给出明确确认，避免无意义等待。
+                        if let Err(err) = write_state(&format!("done {pkg};reason=no_session")) {
+                            eprintln!("[CALIB] 空会话停止确认写入失败: {err}");
+                        }
+                    } else if let Err(err) = write_state("idle") {
+                        eprintln!("[CALIB] 空会话停止状态写入失败: {err}");
                     }
                 }
             }
@@ -94,7 +173,11 @@ fn calibration_loop(config_file: PathBuf) -> io::Result<()> {
                 session_timed_out = true;
             } else if !active.sample_once() {
                 should_finish = true;
-            } else if active.rounds % CALIB_PROGRESS_LOG_ROUNDS == 0 {
+            } else if active.rounds > 0
+                && active.rounds % CALIB_PROGRESS_LOG_ROUNDS == 0
+                && last_progress_log_round != Some(active.rounds)
+            {
+                last_progress_log_round = Some(active.rounds);
                 println!(
                     "[CALIB] 采样中: pkg={} 轮次={} 活跃进程={} 负载项={} 跟踪TID={} 子进程线程摘要={} Top=[{}]",
                     active.pkg,
@@ -108,6 +191,7 @@ fn calibration_loop(config_file: PathBuf) -> io::Result<()> {
             }
         }
         if should_finish {
+            last_progress_log_round = None;
             if let Some(done) = session.take() {
                 if session_timed_out {
                     println!("[CALIB] 校准会话已达到 6 小时上限: {}", done.pkg);
@@ -121,5 +205,25 @@ fn calibration_loop(config_file: PathBuf) -> io::Result<()> {
         }
 
         thread::sleep(SAMPLE_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod calibration_command_tests {
+    use super::*;
+
+    #[test]
+    fn commands_keep_package_ownership() {
+        assert_eq!(
+            parse_calibration_command("start com.example.game"),
+            Some(CalibrationCommand::Start("com.example.game".to_string()))
+        );
+        assert_eq!(
+            parse_calibration_command("stop com.example.game"),
+            Some(CalibrationCommand::Stop(Some("com.example.game".to_string())))
+        );
+        assert_eq!(parse_calibration_command("stop"), Some(CalibrationCommand::Stop(None)));
+        assert_eq!(parse_calibration_command("start bad;state"), None);
+        assert_eq!(parse_calibration_command("stop other package"), None);
     }
 }

@@ -93,6 +93,10 @@ mod platform {
         values: Vec<u32>,
         total_delta: u64,
         busy_delta: u64,
+        // 原始 eBPF 窗口是否没有 sched_switch 增量。即使后面用了 /proc
+        // 兜底，也要保留这个标记，防止坏掉的 eBPF 永远不触发降级。
+        ebpf_window_empty: bool,
+        ebpf_error: Option<String>,
     }
 
     struct GovernorWorker {
@@ -102,6 +106,12 @@ mod platform {
         vendor_usable: bool,
         shared: Arc<Shared>,
         ebpf_empty_samples: u32,
+        restore_journal_synced: bool,
+        // 仅在 eBPF 窗口没有任何调度增量时短暂读取 /proc/stat，避免把
+        // nohz/深度空闲造成的空窗口误当成坏数据；正常窗口不会额外触发 procfs IO。
+        proc_fallback_previous: Vec<CpuTimes>,
+        proc_fallback_ready: bool,
+        ebpf_last_error: Option<String>,
     }
 
     struct Shared {
@@ -157,6 +167,10 @@ mod platform {
                         vendor_usable,
                         shared: worker_shared,
                         ebpf_empty_samples: 0,
+                        restore_journal_synced: false,
+                        proc_fallback_previous: Vec::new(),
+                        proc_fallback_ready: false,
+                        ebpf_last_error: None,
                     }
                     .run()
                 })
@@ -264,6 +278,9 @@ mod platform {
                             self.backend = None;
                             latest_util.clear();
                             self.ebpf_empty_samples = 0;
+                            self.proc_fallback_previous.clear();
+                            self.proc_fallback_ready = false;
+                            self.ebpf_last_error = None;
                             idle_since = None;
                             self.publish_sampler_unloaded();
                             self.wait_for_wake(None, 0);
@@ -282,6 +299,9 @@ mod platform {
                     let (backend, label) = load_backend();
                     self.backend = Some(backend);
                     self.ebpf_empty_samples = 0;
+                    self.proc_fallback_previous.clear();
+                    self.proc_fallback_ready = false;
+                    self.ebpf_last_error = None;
                     latest_util.clear();
                     reported_sample_level = 0;
                     last_sample = Instant::now();
@@ -303,19 +323,23 @@ mod platform {
                 if last_sample.elapsed() >= interval {
                     let sample = self.sample_util();
                     if matches!(self.backend, Some(UtilBackend::Ebpf { .. }))
-                        && (sample.total_delta == 0 || sample.busy_delta == 0)
+                        && sample.ebpf_window_empty
                     {
+                        if let Some(error) = sample.ebpf_error.as_deref() {
+                            self.ebpf_last_error = Some(error.to_string());
+                        }
                         self.ebpf_empty_samples = self.ebpf_empty_samples.saturating_add(1);
                         if self.ebpf_empty_samples >= EBPF_EMPTY_SAMPLE_LIMIT {
-                            let reason = if sample.total_delta == 0 {
-                                "没有调度时间增量"
-                            } else {
-                                "持续没有忙碌时间增量"
-                            };
+                            let reason = self
+                                .ebpf_last_error
+                                .as_deref()
+                                .map(|error| format!("连续读取失败: {error}"))
+                                .unwrap_or_else(|| "连续没有调度时间增量".to_string());
                             let mut previous = Vec::new();
                             let _ = read_proc_stat(&mut previous);
                             self.backend = Some(UtilBackend::Proc { previous });
                             self.ebpf_empty_samples = 0;
+                            self.ebpf_last_error = None;
                             latest_util.clear();
                             reported_sample_level = 0;
                             last_sample = Instant::now();
@@ -326,6 +350,11 @@ mod platform {
                         }
                     } else {
                         self.ebpf_empty_samples = 0;
+                        self.ebpf_last_error = None;
+                        if matches!(self.backend, Some(UtilBackend::Ebpf { .. })) {
+                            self.proc_fallback_previous.clear();
+                            self.proc_fallback_ready = false;
+                        }
                     }
                     latest_util = sample.values;
                     self.apply_util(&latest_util, level);
@@ -422,28 +451,32 @@ mod platform {
         }
 
         fn sample_util(&mut self) -> UtilSample {
-            match self.backend.as_mut() {
+            let ebpf_backend = matches!(self.backend, Some(UtilBackend::Ebpf { .. }));
+            let sample = match self.backend.as_mut() {
                 Some(UtilBackend::Ebpf { util, previous, .. }) => {
                     let mut result = UtilSample::default();
-                    if let Ok(values) = util.get(&0, 0) {
-                        if previous.len() != values.len() {
-                            previous.resize(values.len(), (0, 0));
+                    match util.get(&0, 0) {
+                        Ok(values) => {
+                            if previous.len() != values.len() {
+                                previous.resize(values.len(), (0, 0));
+                            }
+                            for (index, value) in values.iter().enumerate() {
+                                let (old_busy, old_total) = previous[index];
+                                let busy_delta = value.busy_ns.saturating_sub(old_busy);
+                                let total_delta = value.total_ns.saturating_sub(old_total);
+                                result.busy_delta = result.busy_delta.saturating_add(busy_delta);
+                                result.total_delta = result.total_delta.saturating_add(total_delta);
+                                result.values.push(
+                                    busy_delta
+                                        .saturating_mul(100)
+                                        .checked_div(total_delta)
+                                        .unwrap_or(0)
+                                        .min(100) as u32,
+                                );
+                                previous[index] = (value.busy_ns, value.total_ns);
+                            }
                         }
-                        for (index, value) in values.iter().enumerate() {
-                            let (old_busy, old_total) = previous[index];
-                            let busy_delta = value.busy_ns.saturating_sub(old_busy);
-                            let total_delta = value.total_ns.saturating_sub(old_total);
-                            result.busy_delta = result.busy_delta.saturating_add(busy_delta);
-                            result.total_delta = result.total_delta.saturating_add(total_delta);
-                            result.values.push(
-                                busy_delta
-                                    .saturating_mul(100)
-                                    .checked_div(total_delta)
-                                    .unwrap_or(0)
-                                    .min(100) as u32,
-                            );
-                            previous[index] = (value.busy_ns, value.total_ns);
-                        }
+                        Err(error) => result.ebpf_error = Some(error.to_string()),
                     }
                     result
                 }
@@ -452,33 +485,39 @@ mod platform {
                     if !read_proc_stat(&mut current) {
                         return UtilSample::default();
                     }
-                    let mut result = UtilSample {
-                        values: vec![
-                            0;
-                            current.iter().map(|value| value.id).max().unwrap_or(0) + 1
-                        ],
-                        ..UtilSample::default()
-                    };
-                    for now in &current {
-                        if let Some(old) = previous.iter().find(|value| value.id == now.id) {
-                            let total_delta = now.total.saturating_sub(old.total);
-                            let idle_delta = now.idle.saturating_sub(old.idle);
-                            let busy_delta = total_delta.saturating_sub(idle_delta);
-                            result.total_delta = result.total_delta.saturating_add(total_delta);
-                            result.busy_delta = result.busy_delta.saturating_add(busy_delta);
-                            result.values[now.id] = busy_delta
-                                .saturating_mul(100)
-                                .checked_div(total_delta)
-                                .unwrap_or(0)
-                                .min(100)
-                                as u32;
-                        }
-                    }
+                    let result = calculate_proc_sample(previous, &current);
                     *previous = current;
                     result
                 }
                 None => UtilSample::default(),
+            };
+
+            // sched_switch 在 nohz/深度空闲窗口可能完全没有事件。只在这种
+            // 空窗口读取一次 /proc/stat 作为真实同窗口兜底；有事件但 busy=0
+            // 是合法的全空闲状态，不能因此切换后端。
+            if ebpf_backend && sample.total_delta == 0 {
+                let fallback = self.sample_proc_fallback();
+                let mut fallback = fallback;
+                fallback.ebpf_window_empty = true;
+                fallback.ebpf_error = sample.ebpf_error;
+                return fallback;
             }
+            sample
+        }
+
+        fn sample_proc_fallback(&mut self) -> UtilSample {
+            let mut current = Vec::new();
+            if !read_proc_stat(&mut current) {
+                return UtilSample::default();
+            }
+            if !self.proc_fallback_ready {
+                self.proc_fallback_previous = current;
+                self.proc_fallback_ready = true;
+                return UtilSample::default();
+            }
+            let result = calculate_proc_sample(&self.proc_fallback_previous, &current);
+            self.proc_fallback_previous = current;
+            result
         }
 
         fn apply_util(&mut self, utils: &[u32], level: i32) {
@@ -574,7 +613,7 @@ mod platform {
 
                 let previous_written = self.policies[*index].last_written.clone();
                 self.policies[*index].last_written = wanted.clone();
-                if !write_restore(&self.policies, self.vendor.as_ref()) {
+                if !self.persist_restore_journal() {
                     self.policies[*index].last_written = previous_written;
                     continue;
                 }
@@ -589,9 +628,13 @@ mod platform {
                             && (self.policies[*index].available.is_empty()
                                 || self.policies[*index].available.contains(&value))
                     });
-                    if now == wanted || (write_ok && now != current && valid_frequency) {
+                    if now == wanted {
+                        changed = true;
+                        continue;
+                    }
+                    if write_ok && now != current && valid_frequency {
                         self.policies[*index].last_written = now.to_string();
-                        let _ = write_restore(&self.policies, self.vendor.as_ref());
+                        let _ = self.update_restore_journal();
                         changed = true;
                         continue;
                     }
@@ -601,7 +644,7 @@ mod platform {
                     self.policies[*index].original = now.clone();
                     self.policies[*index].last_written = now;
                 }
-                let _ = write_restore(&self.policies, self.vendor.as_ref());
+                let _ = self.update_restore_journal();
             }
             changed
         }
@@ -647,7 +690,7 @@ mod platform {
             if planned.is_empty() {
                 return VendorApplyResult::Handled(false);
             }
-            if !write_restore(&self.policies, self.vendor.as_ref()) {
+            if !self.persist_restore_journal() {
                 if let Some(vendor) = self.vendor.as_mut() {
                     vendor.cpus = backup;
                 }
@@ -695,7 +738,7 @@ mod platform {
                     }
                 }
             }
-            let _ = write_restore(&self.policies, self.vendor.as_ref());
+            let _ = self.update_restore_journal();
             VendorApplyResult::Unavailable
         }
 
@@ -720,8 +763,27 @@ mod platform {
                     policy.last_written = policy.original.clone();
                 }
             }
-            let journal_ok = write_restore(&self.policies, self.vendor.as_ref());
+            let journal_ok = self.update_restore_journal();
             journal_ok && !has_pending_overrides(&self.policies, self.vendor.as_ref())
+        }
+
+        fn persist_restore_journal(&mut self) -> bool {
+            let pending = has_pending_overrides(&self.policies, self.vendor.as_ref());
+            let durable = pending && !self.restore_journal_synced;
+            let written = write_restore(&self.policies, self.vendor.as_ref(), durable);
+            if written {
+                self.restore_journal_synced = pending;
+            }
+            written
+        }
+
+        fn update_restore_journal(&mut self) -> bool {
+            let pending = has_pending_overrides(&self.policies, self.vendor.as_ref());
+            let written = write_restore(&self.policies, self.vendor.as_ref(), false);
+            if written && !pending {
+                self.restore_journal_synced = false;
+            }
+            written
         }
 
         fn restore_vendor(&mut self) {
@@ -882,7 +944,6 @@ mod platform {
                     .unwrap_or(0),
             )
         });
-        dirs.truncate(2);
         dirs.into_iter()
             .filter_map(|dir| {
                 let min_path = dir.join("scaling_min_freq");
@@ -1007,7 +1068,11 @@ mod platform {
         written
     }
 
-    fn write_restore(policies: &[PolicyTarget], vendor: Option<&VendorTarget>) -> bool {
+    fn write_restore(
+        policies: &[PolicyTarget],
+        vendor: Option<&VendorTarget>,
+        durable: bool,
+    ) -> bool {
         let mut content = policies
             .iter()
             .filter(|policy| policy.last_written != policy.original)
@@ -1043,10 +1108,10 @@ mod platform {
                 format_cpu_pairs(&written)
             ));
         }
-        write_restore_content(&content)
+        write_restore_content(&content, durable)
     }
 
-    fn write_restore_content(content: &str) -> bool {
+    fn write_restore_content(content: &str, durable: bool) -> bool {
         if content.is_empty() {
             let removed = match fs::remove_file(RESTORE_FILE) {
                 Ok(()) => true,
@@ -1064,7 +1129,10 @@ mod platform {
             .open(&tmp)
             .and_then(|mut file| {
                 file.write_all(content.as_bytes())?;
-                file.sync_all()
+                if durable {
+                    file.sync_all()?;
+                }
+                Ok(())
             })
             .is_ok();
         if written && fs::rename(&tmp, RESTORE_FILE).is_ok() {
@@ -1099,7 +1167,7 @@ mod platform {
                 retained.push('\n');
             }
         }
-        let _ = write_restore_content(&retained);
+        let _ = write_restore_content(&retained, true);
         recovered
     }
 
@@ -1182,6 +1250,28 @@ mod platform {
             });
         }
         !out.is_empty()
+    }
+
+    fn calculate_proc_sample(previous: &[CpuTimes], current: &[CpuTimes]) -> UtilSample {
+        let mut result = UtilSample {
+            values: vec![0; current.iter().map(|value| value.id).max().unwrap_or(0) + 1],
+            ..UtilSample::default()
+        };
+        for now in current {
+            if let Some(old) = previous.iter().find(|value| value.id == now.id) {
+                let total_delta = now.total.saturating_sub(old.total);
+                let idle_delta = now.idle.saturating_sub(old.idle);
+                let busy_delta = total_delta.saturating_sub(idle_delta);
+                result.total_delta = result.total_delta.saturating_add(total_delta);
+                result.busy_delta = result.busy_delta.saturating_add(busy_delta);
+                result.values[now.id] = busy_delta
+                    .saturating_mul(100)
+                    .checked_div(total_delta)
+                    .unwrap_or(0)
+                    .min(100) as u32;
+            }
+        }
+        result
     }
 
     fn parse_cpu_pairs(value: &str) -> BTreeMap<usize, u64> {

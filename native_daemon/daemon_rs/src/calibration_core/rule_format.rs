@@ -223,21 +223,22 @@ pub(crate) fn format_generated_rules(
             out.push("}".to_string());
         }
         RuleOutputFormat::FunctionBlock => {
+            let function_pkg = format_function_name(pkg);
             out.push(match fallback.as_ref() {
-                Some(cpus) => format!("app({pkg}, {cpus}) {{"),
-                None => format!("app({pkg}) {{"),
+                Some(cpus) => format!("app({function_pkg}, {cpus}) {{"),
+                None => format!("app({function_pkg}) {{"),
             });
             for rule in &threads {
                 out.push(format!(
                     "    thread({}, {})",
-                    rule.thread.as_deref().unwrap_or_default(),
+                    format_function_name(rule.thread.as_deref().unwrap_or_default()),
                     rule.cpus
                 ));
             }
             for rule in &children {
                 out.push(format!(
                     "    process({}, {})",
-                    &rule.owner[pkg.len() + 1..],
+                    format_function_name(&rule.owner[pkg.len() + 1..]),
                     rule.cpus
                 ));
             }
@@ -268,6 +269,18 @@ pub(crate) fn format_generated_rules(
     }
     out.extend(others);
     out
+}
+
+fn format_function_name(name: &str) -> String {
+    let needs_quotes = name.trim() != name
+        || name
+            .chars()
+            .any(|ch| matches!(ch, ',' | '(' | ')' | '"' | '\\'));
+    if !needs_quotes {
+        return name.to_string();
+    }
+    let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 fn is_ambiguous_untyped_thread(pkg: &str, rule: &GeneratedRule) -> bool {
@@ -319,4 +332,23 @@ fn parse_generated_rule(line: String) -> Option<GeneratedRule> {
         cpus: cpus.to_string(),
         original: line,
     })
+}
+
+#[cfg(test)]
+mod function_format_tests {
+    use super::*;
+
+    #[test]
+    fn function_format_quotes_ambiguous_comma_names() {
+        let output = format_generated_rules(
+            "com.example",
+            vec![
+                "com.example{worker,0}=4-7".to_string(),
+                "com.example=0-3,5,7".to_string(),
+            ],
+            RuleOutputFormat::FunctionBlock,
+        );
+        assert!(output.iter().any(|line| line == "    thread(\"worker,0\", 4-7)"));
+        assert!(output.iter().any(|line| line == "app(com.example, 0-3,5,7) {"));
+    }
 }

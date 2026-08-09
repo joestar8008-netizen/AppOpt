@@ -122,17 +122,12 @@ class SparklineView @JvmOverloads constructor(
         val n = values.size
         if (n == 0) return
 
-        // Y 轴按本条线自身峰值归一化: 矮行里也能充满起伏(代价: 不同线程间高度不可直接比较,
-        // 高低由行内 AVG/MAX 文字体现)。至少给 1% 满量程避免全平除零, 峰值上限封顶 100。
-        var maxV = 1f
-        for (v in values) if (v > maxV) maxV = v
-        if (maxV > 100f) maxV = 100f
-
-        // 曲线: X 按采样索引等距, Y 按峰值归一化填满绘图区
+        // 曲线: X 按采样索引等距, Y 始终使用固定 0~100% 量程。
+        // 这样不同线程之间的曲线高度可以直接比较，2% 不会再被放大成满高。
         fun xAt(i: Int): Float =
             if (n == 1) padLR + plotW / 2f else padLR + plotW * i / (n - 1).toFloat()
         fun yAt(v: Float): Float =
-            baseline - (v.coerceIn(0f, 100f) / maxV) * plotH
+            baseline - normalizedCpuLoad(v) * plotH
 
         linePath.reset()
         for (i in 0 until n) {
@@ -141,5 +136,9 @@ class SparklineView @JvmOverloads constructor(
             if (i == 0) linePath.moveTo(x, y) else linePath.lineTo(x, y)
         }
         canvas.drawPath(linePath, linePaint)
+    }
+
+    internal companion object {
+        fun normalizedCpuLoad(value: Float): Float = value.coerceIn(0f, 100f) / 100f
     }
 }

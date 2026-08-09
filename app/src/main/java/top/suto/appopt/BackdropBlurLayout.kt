@@ -1,6 +1,7 @@
 package top.suto.appopt
 
 import android.content.Context
+import android.app.ActivityManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -8,6 +9,7 @@ import android.graphics.PorterDuff
 import android.graphics.RenderEffect
 import android.graphics.Shader
 import android.os.SystemClock
+import android.provider.Settings
 import android.util.AttributeSet
 import android.view.View
 import android.view.ViewTreeObserver
@@ -40,10 +42,30 @@ class BackdropBlurLayout @JvmOverloads constructor(
     private var listenerAttached = false
     private var capturing = false
     private var lastCaptureAt = 0L
+    private var capturePosted = false
+    private val realtimeCaptureEnabled: Boolean
+        get() {
+            val lowRam = (context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager)
+                ?.isLowRamDevice == true
+            val animationsEnabled = runCatching {
+                Settings.Global.getFloat(
+                    context.contentResolver,
+                    Settings.Global.ANIMATOR_DURATION_SCALE,
+                    1f
+                ) > 0f
+            }.getOrDefault(true)
+            return !lowRam && animationsEnabled
+        }
 
-    private val preDrawListener = ViewTreeObserver.OnPreDrawListener {
+    private val captureRunnable = Runnable {
+        capturePosted = false
         captureBackdrop()
-        true
+    }
+    private val scrollChangedListener = ViewTreeObserver.OnScrollChangedListener {
+        requestCapture()
+    }
+    private val globalLayoutListener = ViewTreeObserver.OnGlobalLayoutListener {
+        requestCapture()
     }
 
     init {
@@ -73,30 +95,51 @@ class BackdropBlurLayout @JvmOverloads constructor(
 
     override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
         super.onSizeChanged(width, height, oldWidth, oldHeight)
-        if (width != oldWidth || height != oldHeight) releaseSnapshot()
+        if (width != oldWidth || height != oldHeight) {
+            releaseSnapshot()
+            requestCapture(immediate = true)
+        }
     }
 
     private fun attachListener() {
         val view = target ?: return
         if (!isAttachedToWindow || listenerAttached) return
-        view.viewTreeObserver.addOnPreDrawListener(preDrawListener)
+        if (realtimeCaptureEnabled) {
+            view.viewTreeObserver.addOnScrollChangedListener(scrollChangedListener)
+            view.viewTreeObserver.addOnGlobalLayoutListener(globalLayoutListener)
+        }
         listenerAttached = true
+        requestCapture(immediate = true)
     }
 
     private fun detachListener() {
         val observer = target?.viewTreeObserver
         if (listenerAttached && observer?.isAlive == true) {
-            observer.removeOnPreDrawListener(preDrawListener)
+            observer.removeOnScrollChangedListener(scrollChangedListener)
+            observer.removeOnGlobalLayoutListener(globalLayoutListener)
         }
+        removeCallbacks(captureRunnable)
+        capturePosted = false
         listenerAttached = false
+    }
+
+    private fun requestCapture(immediate: Boolean = false) {
+        if (!isAttachedToWindow || target == null) return
+        if (capturePosted) {
+            if (!immediate) return
+            removeCallbacks(captureRunnable)
+            capturePosted = false
+        }
+        val elapsed = SystemClock.uptimeMillis() - lastCaptureAt
+        val delay = if (immediate) 0L else (CAPTURE_INTERVAL_MS - elapsed).coerceAtLeast(0L)
+        capturePosted = true
+        postDelayed(captureRunnable, delay)
     }
 
     private fun captureBackdrop() {
         val source = target ?: return
         if (capturing || width <= 0 || height <= 0 || !source.isShown) return
-        val now = SystemClock.uptimeMillis()
-        if (now - lastCaptureAt < CAPTURE_INTERVAL_MS) return
-        lastCaptureAt = now
+        lastCaptureAt = SystemClock.uptimeMillis()
 
         ensureSnapshot()
         val bitmap = snapshot ?: return
@@ -142,7 +185,9 @@ class BackdropBlurLayout @JvmOverloads constructor(
     }
 
     private companion object {
-        const val SAMPLE_SCALE = 0.5f
-        const val CAPTURE_INTERVAL_MS = 32L
+        const val SAMPLE_SCALE = 0.25f
+        // 背景抓取必须在主线程调用 View.draw；约 6 FPS 足以维持悬浮底栏的动态质感，
+        // 同时避免列表滑动时每 80ms 重绘整页。
+        const val CAPTURE_INTERVAL_MS = 160L
     }
 }

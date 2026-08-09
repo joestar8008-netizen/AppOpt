@@ -793,11 +793,13 @@ build_foreground_helper
 build_and_embed_app
 
 BPF_SRC="$FPS_MON/bpf/queuebuffer_probe.bpf.c"
+BPF_STATS_SRC="$FPS_MON/bpf/queuebuffer_probe_stats.bpf.c"
 BPF_PERF_SRC="$FPS_MON/bpf/queuebuffer_probe_perf.bpf.c"
 BPF_CPU_UTIL_SRC="$FPS_MON/bpf/cpu_util_monitor.bpf.c"
 mkdir -p "$WORK/config/ebpf"
 BPF_CPU_UTIL_OBJ="$WORK/config/ebpf/cpu_util_monitor.bpf.o"
 [ -f "$BPF_SRC" ] || { echo "! 找不到 BPF 源码: $BPF_SRC"; exit 1; }
+[ -f "$BPF_STATS_SRC" ] || { echo "! 找不到 StatsMap BPF 源码: $BPF_STATS_SRC"; exit 1; }
 [ -f "$BPF_PERF_SRC" ] || { echo "! 找不到 PerfEvent BPF 源码: $BPF_PERF_SRC"; exit 1; }
 [ -f "$BPF_CPU_UTIL_SRC" ] || { echo "! 找不到 CPU 利用率 BPF 源码: $BPF_CPU_UTIL_SRC"; exit 1; }
 
@@ -847,6 +849,7 @@ build_bpf_pair_for_abi() {
     local ebpf_dir="$WORK/config/ebpf/$abidir"
     mkdir -p "$ebpf_dir"
     build_bpf_obj "$BPF_SRC" "$ebpf_dir/queuebuffer_probe.bpf.o" "queuebuffer_probe.bpf.c ($abidir)" "$target_arch" "$include_arch" "$abi_define"
+    build_bpf_obj "$BPF_STATS_SRC" "$ebpf_dir/queuebuffer_probe_stats.bpf.o" "queuebuffer_probe_stats.bpf.c ($abidir)" "$target_arch" "$include_arch" "$abi_define"
     build_bpf_obj "$BPF_PERF_SRC" "$ebpf_dir/queuebuffer_probe_perf.bpf.o" "queuebuffer_probe_perf.bpf.c ($abidir)" "$target_arch" "$include_arch" "$abi_define"
 }
 

@@ -7,10 +7,16 @@
 #define __always_inline inline __attribute__((always_inline))
 
 /* BPF_MAP_TYPE 常量 */
-#define BPF_MAP_TYPE_PERF_EVENT_ARRAY 4
 #define BPF_MAP_TYPE_HASH 1
-#define BPF_F_CURRENT_CPU 0xffffffffULL
+#define BPF_MAP_TYPE_ARRAY 2
 #define BPF_ANY 0
+#if !defined(APPOPT_FRAME_STATS_MAX_ENTRIES)
+#define APPOPT_FRAME_STATS_MAX_ENTRIES 4096
+#endif
+#if !defined(APPOPT_STATS_ONLY_BPF)
+#define BPF_MAP_TYPE_PERF_EVENT_ARRAY 4
+#define BPF_F_CURRENT_CPU 0xffffffffULL
+#endif
 
 /* map 定义宏: __uint 是"数组长度"技巧, 内核 BPF loader 通过 sizeof 读属性 */
 #define __uint(name, val) int(*name)[val]
@@ -23,9 +29,12 @@ static long (*bpf_get_current_pid_tgid)(void) = (void *)14;
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
 static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, unsigned long long flags) = (void *)2;
 
-/* PerfEvent 输出 */
+/* PerfEvent 输出；StatsMap 对象不声明事件通道及其 helper。 */
+#if !defined(APPOPT_STATS_ONLY_BPF)
 static long (*bpf_perf_event_output)(void *ctx, void *map, unsigned long long flags, void *data, unsigned long long size) = (void *)25;
-static long (*bpf_probe_read_user)(void *dst, unsigned long long size, const void *unsafe_ptr) = (void *)112;
+#endif
+/* helper 4 兼容 Android 旧内核；只在 32 位 x86 参数读取分支使用。 */
+static long (*bpf_probe_read_compat)(void *dst, unsigned long long size, const void *unsafe_ptr) = (void *)4;
 
 /* --- uprobe 参数读取 ---
  * queueBuffer 的第一个参数是 Surface/ANativeWindow 指针：
@@ -108,7 +117,7 @@ static __always_inline unsigned long long appopt_read_parm1(void *ctx) {
     if (sp == 0) {
         return 0;
     }
-    if (bpf_probe_read_user(&value, sizeof(value), (const void *)(unsigned long long)(sp + 4)) != 0) {
+    if (bpf_probe_read_compat(&value, sizeof(value), (const void *)(unsigned long long)(sp + 4)) != 0) {
         return 0;
     }
     return (unsigned long long)value;
@@ -139,13 +148,23 @@ struct frame_stats_value {
     unsigned long long total_frames;
 };
 
+/* 目标线程 uprobe 的 TGID 白名单，由 Rust bridge 随进程变化增量更新。 */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(key_size, sizeof(unsigned int));
+    __uint(value_size, sizeof(unsigned int));
+    __uint(max_entries, 128);
+} target_tgids SEC(".maps");
+
 /* --- PerfEvent map --- */
+#if !defined(APPOPT_STATS_ONLY_BPF)
 struct {
     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
     __uint(key_size, sizeof(unsigned int));
     __uint(value_size, sizeof(unsigned int));
     __uint(max_entries, 0);
 } events SEC(".maps");
+#endif
 
 /* --- 内核侧帧计数 map ---
  * PerfEvent 是 per-CPU 事件通道，用户态读取时可能乱序/丢样本。
@@ -155,8 +174,26 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(key_size, sizeof(struct frame_stats_key));
     __uint(value_size, sizeof(struct frame_stats_value));
-    __uint(max_entries, 4096);
+    __uint(max_entries, APPOPT_FRAME_STATS_MAX_ENTRIES);
 } frame_stats SEC(".maps");
+
+/* frame_stats 满时保留累计失败次数；事件后端仍会发送逐帧事件。 */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(key_size, sizeof(unsigned int));
+    __uint(value_size, sizeof(unsigned int));
+    __uint(max_entries, 1);
+} frame_stats_drops SEC(".maps");
+
+/* 用户态确认 frame_stats 可读后写 1。默认值 0 保留逐帧 PerfEvent 兼容路径。 */
+#if !defined(APPOPT_STATS_ONLY_BPF)
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(key_size, sizeof(unsigned int));
+    __uint(value_size, sizeof(unsigned int));
+    __uint(max_entries, 1);
+} perf_stats_only SEC(".maps");
+#endif
 
 static __always_inline int record_frame_stats(struct frame_event *event) {
     struct frame_stats_key key = {};
@@ -181,7 +218,14 @@ static __always_inline int record_frame_stats(struct frame_event *event) {
     struct frame_stats_value initial = {};
     initial.last_ts = event->timestamp_ns;
     initial.total_frames = 1;
-    bpf_map_update_elem(&frame_stats, &key, &initial, BPF_ANY);
+    if (bpf_map_update_elem(&frame_stats, &key, &initial, BPF_ANY) != 0) {
+        unsigned int drop_key = 0;
+        unsigned int *drops = bpf_map_lookup_elem(&frame_stats_drops, &drop_key);
+        if (drops) {
+            __sync_fetch_and_add(drops, 1);
+        }
+        return -1;
+    }
     return 1;
 }
 
@@ -191,16 +235,30 @@ int on_queue_buffer(void *ctx) {
     struct frame_event event = {};
 
     unsigned long long pid_tgid = bpf_get_current_pid_tgid();
-    event.timestamp_ns = bpf_ktime_get_ns();
     event.pid = (unsigned int)(pid_tgid >> 32);
+    if (!bpf_map_lookup_elem(&target_tgids, &event.pid)) {
+        return 0;
+    }
+
+    event.timestamp_ns = bpf_ktime_get_ns();
     event.tid = (unsigned int)pid_tgid;
     event.surface_ptr = appopt_read_parm1(ctx);
 
-    if (!record_frame_stats(&event)) {
+    int stats_result = record_frame_stats(&event);
+    if (stats_result == 0) {
+        return 0;
+    }
+
+    /* StatsMap 后端只更新计数 map，不创建任何事件传输通道。 */
+#if !defined(APPOPT_STATS_ONLY_BPF)
+    unsigned int config_key = 0;
+    unsigned int *stats_only = bpf_map_lookup_elem(&perf_stats_only, &config_key);
+    if (stats_only && *stats_only) {
         return 0;
     }
 
     bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+#endif
     return 0;
 }
 

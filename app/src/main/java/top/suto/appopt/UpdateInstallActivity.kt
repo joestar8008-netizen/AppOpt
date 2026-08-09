@@ -83,12 +83,33 @@ class UpdateInstallActivity : AppCompatActivity() {
 
     private fun rebootSystem() {
         binding.updateInstallReboot.isEnabled = false
-        setStatus("正在重启系统", "已请求 Root 执行 reboot")
+        setStatus("正在请求重启", "正在等待 Root 确认 reboot 命令")
         thread {
-            DaemonBridge.runRootCommand("reboot", timeoutSeconds = 5L)
+            val result = DaemonBridge.runRootCommand("reboot", timeoutSeconds = 5L)
             runOnUiThread {
                 if (!isFinishing && !isDestroyed) {
-                    binding.updateInstallReboot.isEnabled = true
+                    if (result.success) {
+                        setStatus("正在重启系统", "Root 已接受 reboot 命令")
+                        binding.updateInstallReboot.postDelayed({
+                            if (!isFinishing && !isDestroyed &&
+                                !binding.updateInstallReboot.isEnabled) {
+                                binding.updateInstallReboot.isEnabled = true
+                                setStatus(
+                                    "系统尚未重启",
+                                    "reboot 命令已返回，但系统没有开始重启，可再次尝试"
+                                )
+                            }
+                        }, 8_000L)
+                    } else {
+                        binding.updateInstallReboot.isEnabled = true
+                        val detail = if (result.timedOut) {
+                            "Root 命令等待超时，系统仍未重启时可再次尝试"
+                        } else {
+                            "Root 拒绝或无法执行 reboot，请检查 Root 授权"
+                        }
+                        setStatus("重启请求失败", detail)
+                        AppToast.show(this@UpdateInstallActivity, "重启失败，设备尚未确认重启")
+                    }
                 }
             }
         }

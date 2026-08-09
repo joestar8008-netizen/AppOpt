@@ -1,14 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:background="@drawable/bg_bottom_sheet_card"
-    android:orientation="vertical"
-    android:paddingStart="20dp"
-    android:paddingTop="10dp"
-    android:paddingEnd="20dp"
-    android:paddingBottom="18dp">
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingStart="20dp"
+        android:paddingTop="10dp"
+        android:paddingEnd="20dp"
+        android:paddingBottom="18dp">
 
     <View
         android:layout_width="42dp"
@@ -81,8 +86,37 @@
         android:layout_height="wrap_content"
         android:layout_marginTop="9dp"
         android:text="需要更准确的校准结果时，建议保持关闭"
-        android:textColor="@color/text_secondary"
-        android:textSize="12sp" />
+        android:textColor="@color/text_hint_strong"
+        android:textSize="12.5sp" />
+
+    <com.google.android.material.textfield.TextInputLayout
+        android:id="@+id/autoCalibrationDelayBox"
+        style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="14dp"
+        android:hint="延时启动"
+        app:suffixText="毫秒">
+
+        <com.google.android.material.textfield.TextInputEditText
+            android:id="@+id/autoCalibrationDelayInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:digits="0123456789"
+            android:imeOptions="actionDone"
+            android:inputType="number"
+            android:maxLength="5"
+            android:maxLines="1" />
+    </com.google.android.material.textfield.TextInputLayout>
+
+    <TextView
+        android:id="@+id/autoCalibrationDelaySummary"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:textColor="@color/brand_primary_dark"
+        android:textSize="12.5sp"
+        android:textStyle="bold" />
 
     <LinearLayout
         android:layout_width="match_parent"
@@ -92,7 +126,7 @@
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/autoCalibrationWarningCancel"
-            style="@style/Widget.Material3.Button.OutlinedButton"
+            style="@style/AppOutlinedButton"
             android:layout_width="0dp"
             android:layout_height="50dp"
             android:layout_weight="1"
@@ -101,7 +135,7 @@
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/autoCalibrationWarningConfirm"
-            style="@style/Widget.Material3.Button"
+            style="@style/AppPrimaryButton"
             android:layout_width="0dp"
             android:layout_height="50dp"
             android:layout_marginStart="10dp"
@@ -109,4 +143,5 @@
             android:text="继续开启（5 秒）"
             app:cornerRadius="10dp" />
     </LinearLayout>
-</LinearLayout>
+    </LinearLayout>
+</androidx.core.widget.NestedScrollView>

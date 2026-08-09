@@ -92,6 +92,7 @@
 
         <com.google.android.material.materialswitch.MaterialSwitch
             android:id="@+id/autoStartCalibrationSwitch"
+            style="@style/AppMaterialSwitch"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:contentDescription="启动后自动开始校准"
@@ -151,6 +152,7 @@
 
         <com.google.android.material.materialswitch.MaterialSwitch
             android:id="@+id/hideMissingConfiguredSwitch"
+            style="@style/AppMaterialSwitch"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:minWidth="48dp"

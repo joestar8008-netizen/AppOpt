@@ -51,6 +51,7 @@ public final class ForegroundHelper {
     private static final int MAX_EXIT_RECORDS = 64;
     private static final int MAX_RESTORED_LIFECYCLE_RECORDS = 64;
     private static final File BOOT_ID_FILE = new File("/proc/sys/kernel/random/boot_id");
+    private static final String SCENE_PACKAGE = "com.omarea.vtools";
 
     private static final Object SCHEDULE_LOCK = new Object();
     private static Handler handler;
@@ -84,6 +85,8 @@ public final class ForegroundHelper {
     private static boolean deadServiceExitScheduled;
     private static String lastTaskError = "";
     private static long lastTaskErrorLogElapsed;
+    private static long lastScenePackageCheckElapsed;
+    private static String cachedSceneInstalled = "unknown";
     private static Set<String> lastInScopePackages = new LinkedHashSet<>();
     private static final TreeMap<String, Long> lastExitElapsed = new TreeMap<>();
     private static final TreeMap<String, LifecycleRecord> lifecyclePackages = new TreeMap<>();
@@ -446,6 +449,7 @@ public final class ForegroundHelper {
         lastInScopePackages = new LinkedHashSet<>(inScopePackages);
         pruneExitRecords();
         final long currentGeneration = ++generation;
+        final String sceneInstalled = sceneInstalledState(snapshotElapsed);
         writeState(out -> {
             line(out, "version", "2");
             line(out, "boot_id", bootId);
@@ -457,6 +461,7 @@ public final class ForegroundHelper {
             line(out, "updated_elapsed_ms", String.valueOf(snapshotElapsed));
             line(out, "updated_wall_ms", String.valueOf(snapshotWall));
             line(out, "interactive", interactiveState());
+            line(out, "scene_installed", sceneInstalled);
             line(out, "reason", reason);
             line(out, "selection", selection);
             line(out, "focused_package", result == null ? "" : result.component.getPackageName());
@@ -478,6 +483,8 @@ public final class ForegroundHelper {
             return;
         }
         final long currentGeneration = ++generation;
+        final long nowElapsed = SystemClock.elapsedRealtime();
+        final String sceneInstalled = sceneInstalledState(nowElapsed);
         writeState(out -> {
             line(out, "version", "2");
             line(out, "boot_id", bootId);
@@ -486,9 +493,10 @@ public final class ForegroundHelper {
             line(out, "sdk", String.valueOf(Build.VERSION.SDK_INT));
             line(out, "pid", String.valueOf(Process.myPid()));
             line(out, "generation", String.valueOf(currentGeneration));
-            line(out, "updated_elapsed_ms", String.valueOf(SystemClock.elapsedRealtime()));
+            line(out, "updated_elapsed_ms", String.valueOf(nowElapsed));
             line(out, "updated_wall_ms", String.valueOf(System.currentTimeMillis()));
             line(out, "interactive", interactiveState());
+            line(out, "scene_installed", sceneInstalled);
             line(out, "reason", reason);
             line(out, "selection", "none");
             line(out, "focused_package", "");
@@ -569,6 +577,21 @@ public final class ForegroundHelper {
         }
     }
 
+    private static String sceneInstalledState(long nowElapsed) {
+        if (lastScenePackageCheckElapsed > 0L
+                && nowElapsed - lastScenePackageCheckElapsed < LISTENER_RECONCILE_MS) {
+            return cachedSceneInstalled;
+        }
+        lastScenePackageCheckElapsed = nowElapsed;
+        try {
+            cachedSceneInstalled = getPackageInfo(SCENE_PACKAGE) == null ? "0" : "1";
+        } catch (Throwable ignored) {
+            packageManager = null;
+            cachedSceneInstalled = "unknown";
+        }
+        return cachedSceneInstalled;
+    }
+
     private static void syncPackageUidMap(String reason) {
         if (appListFile == null || uidMapFile == null || !appListFile.isFile()) {
             return;
@@ -616,11 +639,6 @@ public final class ForegroundHelper {
             }
         }
 
-        if (!packages.isEmpty() && uidMap.isEmpty()) {
-            System.err.println("[前台助手] package_uid.map 未更新: 未解析到任何已安装应用 UID");
-            return;
-        }
-
         UidMapWriteResult writeResult = writeUidMap(uidMap);
         if (writeResult == UidMapWriteResult.FAILED) {
             return;
@@ -658,6 +676,10 @@ public final class ForegroundHelper {
         int comment = line.indexOf("//");
         if (comment >= 0) {
             line = line.substring(0, comment).trim();
+        }
+        int hashComment = line.indexOf('#');
+        if (hashComment >= 0) {
+            line = line.substring(0, hashComment).trim();
         }
         if (line.isEmpty()) {
             return "";

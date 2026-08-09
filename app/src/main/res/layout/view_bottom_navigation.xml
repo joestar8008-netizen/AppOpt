@@ -12,7 +12,8 @@
     <top.suto.appopt.BackdropBlurLayout
         android:id="@+id/bottomNavigationBlur"
         android:layout_width="match_parent"
-        android:layout_height="@dimen/bottom_navigation_blur_height"
+        android:layout_height="wrap_content"
+        android:minHeight="@dimen/bottom_navigation_blur_height"
         android:layout_gravity="top|center_horizontal"
         android:layout_marginTop="@dimen/bottom_navigation_top_margin"
         android:background="@drawable/bg_bottom_navigation_clip"
@@ -31,7 +32,8 @@
         <top.suto.appopt.ResponsiveBottomNavigationView
             android:id="@+id/bottomNavigation"
             android:layout_width="match_parent"
-            android:layout_height="@dimen/bottom_navigation_content_height"
+            android:layout_height="wrap_content"
+            android:minHeight="@dimen/bottom_navigation_content_height"
             android:layout_gravity="center"
             android:background="@android:color/transparent"
             android:elevation="0dp"

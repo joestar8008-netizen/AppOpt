@@ -3,10 +3,12 @@ package top.suto.appopt
 import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.content.pm.PackageManager
 import android.animation.ObjectAnimator
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.Rect
@@ -29,18 +31,27 @@ import android.text.style.ReplacementSpan
 import android.util.LruCache
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewConfiguration
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import android.view.animation.DecelerateInterpolator
 import android.view.animation.LinearInterpolator
 import android.widget.GridLayout
 import android.widget.ImageView
 import android.widget.TextView
+import android.widget.CompoundButton
 import androidx.appcompat.app.AppCompatActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.OnBackPressedCallback
 import androidx.core.content.ContextCompat
+import androidx.coordinatorlayout.widget.CoordinatorLayout
 import androidx.fragment.app.Fragment
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.ListAdapter
@@ -60,11 +71,14 @@ import top.suto.appopt.databinding.DialogDiscardRulesBinding
 import top.suto.appopt.databinding.DialogFloatingInterruptionBinding
 import top.suto.appopt.databinding.DialogRuleHistoryPickerBinding
 import top.suto.appopt.databinding.DialogThreadWildcardBinding
+import top.suto.appopt.databinding.DialogThreadWildcardBatchBinding
 import top.suto.appopt.databinding.ItemAddAppBinding
 import top.suto.appopt.databinding.ItemAutoAppBinding
 import top.suto.appopt.databinding.ItemConfigRuleBinding
 import top.suto.appopt.databinding.ItemConfiguredAppBinding
 import top.suto.appopt.databinding.ItemRuleHistoryCandidateBinding
+import top.suto.appopt.databinding.ItemThreadRuleEditorBinding
+import top.suto.appopt.databinding.ItemThreadWildcardChoiceBinding
 import top.suto.appopt.databinding.ViewUsageGuideOverlayBinding
 import top.suto.appopt.db.AppOptDbHelper
 import java.text.SimpleDateFormat
@@ -72,6 +86,7 @@ import java.util.Collections
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -87,6 +102,7 @@ class MainActivity : AppCompatActivity() {
     private var ruleHealth: Map<String, DaemonBridge.RuleHealth> = emptyMap()
     private var jankBoostPackages: Set<String> = emptySet()
     private var foregroundHelperStatus = ForegroundHelperStatus()
+    private var sceneCoreAllocationState: DaemonBridge.SceneCoreAllocationState? = null
     private var moduleVersion: DaemonBridge.ModuleVersion? = null
     private var moduleCompatible = false
     private var pendingModuleUpdate = false
@@ -110,8 +126,12 @@ class MainActivity : AppCompatActivity() {
     private var addableAppsLoading = true
     private var hideMissingConfigured = false
     private var autoStartCalibrationEnabled = false
+    private var autoStartCalibrationDelayMs = 0L
     private var autoStartCalibrationSwitchUpdating = false
     private var autoStartCalibrationWarningTimer: CountDownTimer? = null
+    private var autoStartCalibrationWarningDialog: BottomSheetDialog? = null
+    private var autoStartCalibrationWarningDraft: String? = null
+    private var autoStartCalibrationWarningDeadline = 0L
     private var environmentLoadingShownAt = 0L
     private var appSearchRender: Runnable? = null
     private var emptyIconAnimator: ObjectAnimator? = null
@@ -153,6 +173,74 @@ class MainActivity : AppCompatActivity() {
     private var usageGuideBackCallback: OnBackPressedCallback? = null
     private var startupGuideShown = false
     private var usageGuideAddInFlight = false
+    private var usageGuideWaitingForPrerequisites = false
+    private var usageGuideRootRequestInFlight = false
+    private var usageGuideRootRequestAttempted = false
+    private var usageGuideSkipNextResumeRefresh = false
+    private var activeRuleDraftProvider: (() -> ConfigRulesRestore)? = null
+    private var activeRuleDraftToken: Any? = null
+    private var activeRuleEditorDraftProvider: (() -> RuleEditorRestore)? = null
+    private var activeRuleEditorToken: Any? = null
+    private var ruleDraftRestoreStarted = false
+
+    private val ruleDraftHolder: RuleDraftHolder by lazy {
+        ViewModelProvider(
+            this,
+            object : ViewModelProvider.Factory {
+                override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                    require(modelClass == RuleDraftHolder::class.java)
+                    @Suppress("UNCHECKED_CAST")
+                    return RuleDraftHolder() as T
+                }
+            }
+        )[RuleDraftHolder::class.java]
+    }
+
+    private data class RuleDraftLine(
+        val sourceIndex: Int?,
+        val line: String
+    )
+
+    private data class ThreadEditorRestore(
+        val owner: String,
+        val name: String,
+        val cpus: Set<Int>
+    )
+
+    private data class RuleEditorRestore(
+        val sourceIndex: Int?,
+        val draftIndex: Int?,
+        val checkedType: Int,
+        val childSuffix: String,
+        val cpuSelections: Map<Int, Set<Int>>,
+        val threads: List<ThreadEditorRestore>
+    )
+
+    private data class ConfigRulesRestore(
+        val entryPkg: String,
+        val targets: List<String>,
+        val originalLines: List<String>,
+        val draftLines: List<RuleDraftLine>,
+        val allowedCpus: Set<Int>,
+        val searchQuery: String,
+        val filter: ConfigRuleFilter,
+        val expandedChildOwners: Set<String>,
+        val editor: RuleEditorRestore?
+    )
+
+    private class RuleDraftHolder : ViewModel() {
+        var restore: ConfigRulesRestore? = null
+    }
+    private var pendingUsageGuideRestore: UsageGuideRestore? = null
+
+    private data class UsageGuideRestore(
+        val stepIds: List<String>,
+        val index: Int,
+        val forced: Boolean,
+        val previousPage: Int,
+        val previousAppTab: AppTab,
+        val previousSettingsTab: Int
+    )
 
     private data class ForegroundHelperStatus(
         val state: DaemonBridge.TaskForegroundState? = null,
@@ -163,13 +251,30 @@ class MainActivity : AppCompatActivity() {
         const val PREFS_NAME = "appopt_prefs"
         const val PREF_HIDE_MISSING_CONFIGURED = "hide_missing_configured"
         const val PREF_AUTO_START_CALIBRATION = "auto_start_calibration"
+        const val PREF_AUTO_START_CALIBRATION_DELAY_MS = "auto_start_calibration_delay_ms"
         const val AUTO_START_CALIBRATION_WARNING_MS = 5_000L
         const val MIN_ENV_LOADING_MS = 1800L
         const val RULE_TOOLS_THRESHOLD = 9
+        const val RULE_SWIPE_REVEAL_DP = 64f
+        const val RULE_SWIPE_SNAP_MS = 180L
         const val RULE_HEALTH_SETTLE_MS = 2600L
         const val TOP_LEVEL_REFRESH_INTERVAL_MS = 5_000L
         const val MAX_EDITOR_CPU_COUNT = 128
+        const val MAX_RULE_HISTORY_SELECTION = 32
         const val STATE_TOP_LEVEL_PAGE = "top_level_page"
+        const val STATE_APP_TAB = "app_tab"
+        const val STATE_APP_SEARCH_QUERY = "app_search_query"
+        const val STATE_PENDING_FLOATING_LAUNCH_PKG = "pending_floating_launch_pkg"
+        const val STATE_USAGE_GUIDE_ACTIVE = "usage_guide_active"
+        const val STATE_USAGE_GUIDE_STEP_IDS = "usage_guide_step_ids"
+        const val STATE_USAGE_GUIDE_INDEX = "usage_guide_index"
+        const val STATE_USAGE_GUIDE_FORCED = "usage_guide_forced"
+        const val STATE_USAGE_GUIDE_PREVIOUS_PAGE = "usage_guide_previous_page"
+        const val STATE_USAGE_GUIDE_PREVIOUS_APP_TAB = "usage_guide_previous_app_tab"
+        const val STATE_USAGE_GUIDE_PREVIOUS_SETTINGS_TAB = "usage_guide_previous_settings_tab"
+        const val STATE_AUTO_CALIBRATION_WARNING_ACTIVE = "auto_calibration_warning_active"
+        const val STATE_AUTO_CALIBRATION_WARNING_DRAFT = "auto_calibration_warning_draft"
+        const val STATE_AUTO_CALIBRATION_WARNING_REMAINING = "auto_calibration_warning_remaining"
         val TOP_LEVEL_PAGE_IDS = setOf(
             R.id.navApps,
             R.id.navEnvironment,
@@ -229,10 +334,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     private data class ConfigRuleListItem(
-        val listIndex: Int,
-        val rule: EditableConfigRule,
-        val health: DaemonBridge.RuleHealth?
+        val stableKey: String,
+        val listIndex: Int?,
+        val rule: EditableConfigRule?,
+        val health: DaemonBridge.RuleHealth?,
+        val kind: ConfigRuleRowKind = ConfigRuleRowKind.RULE,
+        val owner: String = rule?.owner.orEmpty(),
+        val childCount: Int = 0,
+        val expanded: Boolean = false,
+        val isLastChild: Boolean = false
     )
+
+    private enum class ConfigRuleRowKind {
+        RULE,
+        CHILD_PROCESS_GROUP,
+        CHILD_THREAD
+    }
 
     private enum class ConfigRuleFilter {
         ALL,
@@ -248,6 +365,28 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        appTab = AppTab.entries.getOrElse(
+            savedInstanceState?.getInt(STATE_APP_TAB, AppTab.PENDING.ordinal)
+                ?: AppTab.PENDING.ordinal
+        ) { AppTab.PENDING }
+        appSearchQuery = savedInstanceState?.getString(STATE_APP_SEARCH_QUERY).orEmpty()
+        pendingFloatingLaunchPkg = savedInstanceState
+            ?.getString(STATE_PENDING_FLOATING_LAUNCH_PKG)
+            ?.takeIf(String::isNotBlank)
+        pendingUsageGuideRestore = savedInstanceState?.takeIf {
+            it.getBoolean(STATE_USAGE_GUIDE_ACTIVE, false)
+        }?.let { state ->
+            UsageGuideRestore(
+                stepIds = state.getStringArrayList(STATE_USAGE_GUIDE_STEP_IDS).orEmpty(),
+                index = state.getInt(STATE_USAGE_GUIDE_INDEX, 0),
+                forced = state.getBoolean(STATE_USAGE_GUIDE_FORCED, false),
+                previousPage = state.getInt(STATE_USAGE_GUIDE_PREVIOUS_PAGE, R.id.navApps),
+                previousAppTab = AppTab.entries.getOrElse(
+                    state.getInt(STATE_USAGE_GUIDE_PREVIOUS_APP_TAB, AppTab.PENDING.ordinal)
+                ) { AppTab.PENDING },
+                previousSettingsTab = state.getInt(STATE_USAGE_GUIDE_PREVIOUS_SETTINGS_TAB, 0)
+            )
+        }
         binding = ActivityMainBinding.inflate(layoutInflater)
         val pendingGuideSteps = UsageGuide.pendingSteps(this)
         setContentView(binding.root)
@@ -268,6 +407,9 @@ class MainActivity : AppCompatActivity() {
         val preferences = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         hideMissingConfigured = preferences.getBoolean(PREF_HIDE_MISSING_CONFIGURED, false)
         autoStartCalibrationEnabled = preferences.getBoolean(PREF_AUTO_START_CALIBRATION, false)
+        autoStartCalibrationDelayMs = AutoStartCalibrationDelay.normalize(
+            preferences.getLong(PREF_AUTO_START_CALIBRATION_DELAY_MS, 0L)
+        )
 
         binding.statusSection.root.setOnClickListener {
             selectTopLevelPage(R.id.navEnvironment)
@@ -278,10 +420,30 @@ class MainActivity : AppCompatActivity() {
         setupAppTabs()
         setupAppSearch()
         setupAutoStartCalibration()
+        if (savedInstanceState?.getBoolean(STATE_AUTO_CALIBRATION_WARNING_ACTIVE, false) == true) {
+            val draft = savedInstanceState.getString(STATE_AUTO_CALIBRATION_WARNING_DRAFT)
+            val remaining = savedInstanceState.getLong(
+                STATE_AUTO_CALIBRATION_WARNING_REMAINING,
+                AUTO_START_CALIBRATION_WARNING_MS
+            )
+            binding.root.post {
+                if (!activityDestroyed && !isFinishing && !isDestroyed) {
+                    showAutoStartCalibrationWarning(draft, remaining)
+                }
+            }
+        }
         setupConfiguredFilter()
         setupAppRecycler()
+        binding.appSection.appTabs.getTabAt(appTab.ordinal)?.let { tab ->
+            if (!tab.isSelected) binding.appSection.appTabs.selectTab(tab)
+        }
+        if (appSearchQuery.isNotEmpty()) {
+            binding.appSection.appSearchInput.setText(appSearchQuery)
+            binding.appSection.appSearchInput.setSelection(appSearchQuery.length)
+        }
         renderEnvironmentOverview()
         buildAppList()
+        restoreModuleUpdateDialogIfNeeded()
         scheduleTopLevelPrewarm()
 
         // root 检测 + 读配置 + 批量导入旧 .log 放后台线程，避免 su 弹窗阻塞 UI
@@ -301,6 +463,14 @@ class MainActivity : AppCompatActivity() {
             }
             val running = runtime.running
             val helperStatus = if (r && compatible && !pendingUpdate) queryForegroundHelperStatus() else ForegroundHelperStatus()
+            val sceneState = if (r && compatible && !pendingUpdate) {
+                DaemonBridge.readSceneCoreAllocationState(
+                    runtime.pid,
+                    helperStatus.state?.sceneInstalled
+                )
+            } else {
+                null
+            }
             val enabled = r && compatible && running
 
             runOnUiThreadIfEnvironmentCurrent(startupEnvironmentGeneration) {
@@ -315,6 +485,7 @@ class MainActivity : AppCompatActivity() {
                     daemonRunning = running
                     daemonRuntime = runtime
                     foregroundHelperStatus = helperStatus
+                    sceneCoreAllocationState = sceneState
                     environmentLoading = false
                     if (!enabled) {
                         appListRequests.next()
@@ -429,6 +600,18 @@ class MainActivity : AppCompatActivity() {
             }
 
             configAfterFormat?.let { migrateLogsLater(enabled, it) }
+            } catch (error: Exception) {
+                android.util.Log.e("AppOpt", "startup environment refresh failed", error)
+                runOnUiThreadIfEnvironmentCurrent(startupEnvironmentGeneration) {
+                    // 后台读取失败时保留已经显示的快照，但必须解除加载态，避免页面永久转圈。
+                    environmentLoading = false
+                    appListsLoading = false
+                    addableAppsLoading = false
+                    binding.appRefresh.isRefreshing = false
+                    renderEnvironmentOverview()
+                    buildAppList()
+                    toast("运行环境读取失败，请稍后重试")
+                }
             } finally {
                 startupLoadInFlight = false
             }
@@ -457,9 +640,11 @@ class MainActivity : AppCompatActivity() {
         renderEnvironmentOverview()
         val appsVisible = selectedTopLevelPage == R.id.navApps
         val shouldRefreshConfig = firstResume.not() && appsVisible
+        val skipGuideRefresh = usageGuideSkipNextResumeRefresh
+        usageGuideSkipNextResumeRefresh = false
         firstResume = false
         // 守护进程、Root 授权和配置可能在后台变化，回到前台时后台重查一次。
-        if (shouldRefreshConfig) {
+        if (shouldRefreshConfig && !usageGuideRootRequestInFlight && !skipGuideRefresh) {
             refreshForegroundState(
                 refreshConfig = true,
                 lifecycleGeneration = lifecycleGeneration
@@ -520,6 +705,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun maybeShowStartupUsageGuide(steps: List<UsageGuide.Step>) {
+        pendingUsageGuideRestore?.let { restore ->
+            val savedIds = restore.stepIds.toSet()
+            val restoredSteps = UsageGuide.steps.filter { it.id in savedIds }
+            pendingUsageGuideRestore = null
+            if (restoredSteps.isNotEmpty()) {
+                startupGuideShown = true
+                showUsageGuide(
+                    showAll = !restore.forced,
+                    requestedSteps = restoredSteps,
+                    restore = restore
+                )
+                return
+            }
+        }
         if (startupGuideShown || steps.isEmpty() || activityDestroyed) return
         startupGuideShown = true
         showUsageGuide(showAll = false, requestedSteps = steps)
@@ -527,20 +726,25 @@ class MainActivity : AppCompatActivity() {
 
     private fun showUsageGuide(
         showAll: Boolean,
-        requestedSteps: List<UsageGuide.Step>?
+        requestedSteps: List<UsageGuide.Step>?,
+        restore: UsageGuideRestore? = null
     ) {
         if (activityDestroyed || isFinishing || isDestroyed || usageGuideBinding != null) return
         val steps = requestedSteps ?: if (showAll) UsageGuide.steps else UsageGuide.pendingSteps(this)
         if (steps.isEmpty()) return
 
         usageGuideSteps = steps
-        usageGuideIndex = 0
-        usageGuideForced = !showAll
+        usageGuideIndex = restore?.index?.coerceIn(0, steps.lastIndex) ?: 0
+        usageGuideForced = restore?.forced ?: !showAll
         usageGuideAddInFlight = false
-        usageGuidePreviousPage = selectedTopLevelPage
-        usageGuidePreviousAppTab = appTab
-        usageGuidePreviousSettingsTab =
-            (supportFragmentManager.findFragmentByTag(topLevelFragmentTag(R.id.navSettings)) as? SettingsFragment)
+        usageGuideWaitingForPrerequisites = false
+        usageGuideRootRequestInFlight = false
+        usageGuideRootRequestAttempted = false
+        usageGuideSkipNextResumeRefresh = false
+        usageGuidePreviousPage = restore?.previousPage ?: selectedTopLevelPage
+        usageGuidePreviousAppTab = restore?.previousAppTab ?: appTab
+        usageGuidePreviousSettingsTab = restore?.previousSettingsTab
+            ?: (supportFragmentManager.findFragmentByTag(topLevelFragmentTag(R.id.navSettings)) as? SettingsFragment)
                 ?.currentUsageGuideTabIndex() ?: 0
 
         val overlay = ViewUsageGuideOverlayBinding.inflate(layoutInflater, binding.root, false)
@@ -570,6 +774,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderUsageGuideStep() {
         val overlay = usageGuideBinding ?: return
+        blockedState()?.let { blocked ->
+            renderUsageGuidePrerequisite(blocked)
+            return
+        }
+        usageGuideWaitingForPrerequisites = false
+        overlay.guideCoachProgress.visibility = View.VISIBLE
+        setUsageGuideNextStartMargin(10)
         val step = usageGuideSteps.getOrNull(usageGuideIndex) ?: return
         if (step.target == UsageGuide.Target.START_CALIBRATION && appLists.pending.isEmpty() &&
             usageGuideIndex < usageGuideSteps.lastIndex) {
@@ -585,15 +796,19 @@ class MainActivity : AppCompatActivity() {
         }
         overlay.guideCoachProgress.text = "${usageGuideIndex + 1} / ${usageGuideSteps.size}"
         val existingPendingGuide = step.target == UsageGuide.Target.ADD_APP && appLists.pending.isNotEmpty()
-        overlay.guideCoachTitle.text = if (existingPendingGuide) {
-            "已有待校准应用"
-        } else {
-            step.title
+        val noAddableGuide = step.target == UsageGuide.Target.ADD_APP &&
+            appLists.pending.isEmpty() && !addableAppsLoading && appLists.addable.isEmpty()
+        overlay.guideCoachTitle.text = when {
+            existingPendingGuide -> "已有待校准应用"
+            noAddableGuide -> "暂时没有可添加应用"
+            else -> step.title
         }
-        overlay.guideCoachDescription.text = if (existingPendingGuide) {
-            "已检测到待校准列表中有应用，无需重复添加。下一步会介绍右侧播放按钮，以及如何启动悬浮校准。"
-        } else {
-            step.description
+        overlay.guideCoachDescription.text = when {
+            existingPendingGuide ->
+                "已检测到待校准列表中有应用，无需重复添加。下一步会介绍右侧播放按钮，以及如何启动悬浮校准。"
+            noAddableGuide ->
+                "当前没有可添加的应用。可以先继续查看教程，安装新应用后再回到待校准列表。"
+            else -> step.description
         }
         updateUsageGuideControls(step)
         overlay.root.contentDescription =
@@ -606,6 +821,91 @@ class MainActivity : AppCompatActivity() {
             90L
         )
         overlay.root.sendAccessibilityEvent(AccessibilityEvent.TYPE_VIEW_FOCUSED)
+    }
+
+    private fun renderUsageGuidePrerequisite(blocked: EmptyState) {
+        val overlay = usageGuideBinding ?: return
+        usageGuideWaitingForPrerequisites = true
+        overlay.root.clearSpotlight()
+        overlay.guideCoachMode.text = "开始之前"
+        overlay.guideCoachProgress.visibility = View.GONE
+        overlay.guideCoachPrevious.visibility = View.GONE
+        setUsageGuideNextStartMargin(0)
+
+        val checkingEnvironment = environmentLoading && !usageGuideRootRequestInFlight
+        overlay.guideCoachTitle.text = when {
+            usageGuideRootRequestInFlight -> "正在等待 Root 授权"
+            checkingEnvironment -> "正在检查运行环境"
+            !hasRoot -> "需要 Root 权限"
+            else -> blocked.title
+        }
+        overlay.guideCoachDescription.text = when {
+            usageGuideRootRequestInFlight ->
+                "请在 Root 管理器中允许 AppOpt。授权完成后会自动检查模块和应用列表，再从第 ${usageGuideIndex + 1} 步继续教程。"
+            checkingEnvironment ->
+                "正在确认 Root、模块和守护进程状态。准备完成后会自动进入教程，不需要重复点击。"
+            !hasRoot -> {
+                val retryHint = if (usageGuideRootRequestAttempted) {
+                    "刚才没有检测到授权，可以点击下方按钮重新申请。"
+                } else {
+                    "请先授予权限，再开始教程。"
+                }
+                "应用列表、添加应用和悬浮校准都依赖 Root。$retryHint"
+            }
+            else -> "${blocked.desc}\n\n处理完成后点击重新检测，教程会从当前步骤继续。"
+        }
+        overlay.guideCoachNext.isEnabled = !usageGuideRootRequestInFlight && !checkingEnvironment
+        overlay.guideCoachNext.text = when {
+            usageGuideRootRequestInFlight -> "正在等待授权"
+            checkingEnvironment -> "正在检测"
+            !hasRoot && usageGuideRootRequestAttempted -> "重新申请 Root"
+            !hasRoot -> "申请 Root 权限"
+            else -> "重新检测"
+        }
+        overlay.root.contentDescription =
+            "使用教程开始前检查，${overlay.guideCoachTitle.text}，${overlay.guideCoachDescription.text}"
+        overlay.root.spotlight(binding.statusSection.root, overlay.guideCoachCard)
+        overlay.root.sendAccessibilityEvent(AccessibilityEvent.TYPE_VIEW_FOCUSED)
+    }
+
+    private fun setUsageGuideNextStartMargin(marginDp: Int) {
+        val next = usageGuideBinding?.guideCoachNext ?: return
+        val params = next.layoutParams as? ViewGroup.MarginLayoutParams ?: return
+        params.marginStart = TypedValue.applyDimension(
+            TypedValue.COMPLEX_UNIT_DIP,
+            marginDp.toFloat(),
+            resources.displayMetrics
+        ).toInt()
+        next.layoutParams = params
+    }
+
+    private fun requestUsageGuidePrerequisites() {
+        if (usageGuideBinding == null || usageGuideRootRequestInFlight || environmentLoading) return
+        usageGuideRootRequestAttempted = true
+        usageGuideRootRequestInFlight = true
+        usageGuideSkipNextResumeRefresh = true
+        environmentLoading = true
+        appListsLoading = true
+        addableAppsLoading = true
+        renderEnvironmentOverview()
+        buildAppList()
+        renderUsageGuideStep()
+        refreshForegroundState(
+            refreshConfig = true,
+            forceFullAppListRefresh = true,
+            onApplied = {
+                usageGuideRootRequestInFlight = false
+                if (activityResumed) usageGuideSkipNextResumeRefresh = false
+                refreshUsageGuideForEnvironmentState()
+            }
+        )
+    }
+
+    private fun refreshUsageGuideForEnvironmentState() {
+        if (usageGuideBinding == null) return
+        if (usageGuideWaitingForPrerequisites || blockedState() != null) {
+            renderUsageGuideStep()
+        }
     }
 
     private fun updateUsageGuideControls(step: UsageGuide.Step) {
@@ -621,6 +921,11 @@ class MainActivity : AppCompatActivity() {
                 overlay.guideCoachNext.isEnabled = !addableAppsLoading
                 overlay.guideCoachNext.text =
                     if (addableAppsLoading) "正在加载应用" else "请点击列表中的 +"
+            }
+            step.target == UsageGuide.Target.ADD_APP &&
+                appLists.pending.isEmpty() && !addableAppsLoading && appLists.addable.isEmpty() -> {
+                overlay.guideCoachNext.isEnabled = true
+                overlay.guideCoachNext.text = "跳过此步"
             }
             usageGuideIndex == usageGuideSteps.lastIndex -> {
                 overlay.guideCoachNext.isEnabled = true
@@ -639,6 +944,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun handleUsageGuideNext() {
         if (usageGuideAddInFlight) return
+        if (blockedState() != null) {
+            requestUsageGuidePrerequisites()
+            return
+        }
         val step = usageGuideSteps.getOrNull(usageGuideIndex) ?: return
         if (requiresUsageGuideAdd(step)) {
             if (!addableAppsLoading) toast("请先在亮起的列表中添加一个应用")
@@ -826,6 +1135,10 @@ class MainActivity : AppCompatActivity() {
         if (markCompleted) UsageGuide.markCompleted(this, usageGuideSteps)
         usageGuideBinding = null
         usageGuideAddInFlight = false
+        usageGuideWaitingForPrerequisites = false
+        usageGuideRootRequestInFlight = false
+        usageGuideRootRequestAttempted = false
+        usageGuideSkipNextResumeRefresh = false
         usageGuideBackCallback?.remove()
         usageGuideBackCallback = null
         (overlay.root.parent as? ViewGroup)?.removeView(overlay.root)
@@ -1002,7 +1315,50 @@ class MainActivity : AppCompatActivity() {
     private fun topLevelFragmentTag(itemId: Int) = "top_level_$itemId"
 
     override fun onSaveInstanceState(outState: Bundle) {
+        activeRuleDraftProvider?.invoke()?.let { draft ->
+            ruleDraftHolder.restore = draft.copy(editor = activeRuleEditorDraftProvider?.invoke())
+        }
         outState.putInt(STATE_TOP_LEVEL_PAGE, selectedTopLevelPage)
+        outState.putInt(STATE_APP_TAB, appTab.ordinal)
+        outState.putString(STATE_APP_SEARCH_QUERY, appSearchQuery)
+        pendingFloatingLaunchPkg?.let {
+            outState.putString(STATE_PENDING_FLOATING_LAUNCH_PKG, it)
+        }
+        val guideState = if (usageGuideBinding != null && usageGuideSteps.isNotEmpty()) {
+            UsageGuideRestore(
+                stepIds = usageGuideSteps.map(UsageGuide.Step::id),
+                index = usageGuideIndex,
+                forced = usageGuideForced,
+                previousPage = usageGuidePreviousPage,
+                previousAppTab = usageGuidePreviousAppTab,
+                previousSettingsTab = usageGuidePreviousSettingsTab
+            )
+        } else {
+            pendingUsageGuideRestore
+        }
+        guideState?.let { state ->
+            outState.putBoolean(STATE_USAGE_GUIDE_ACTIVE, true)
+            outState.putStringArrayList(STATE_USAGE_GUIDE_STEP_IDS, ArrayList(state.stepIds))
+            outState.putInt(STATE_USAGE_GUIDE_INDEX, state.index)
+            outState.putBoolean(STATE_USAGE_GUIDE_FORCED, state.forced)
+            outState.putInt(STATE_USAGE_GUIDE_PREVIOUS_PAGE, state.previousPage)
+            outState.putInt(STATE_USAGE_GUIDE_PREVIOUS_APP_TAB, state.previousAppTab.ordinal)
+            outState.putInt(STATE_USAGE_GUIDE_PREVIOUS_SETTINGS_TAB, state.previousSettingsTab)
+        }
+        if (autoStartCalibrationWarningDialog?.isShowing == true) {
+            outState.putBoolean(STATE_AUTO_CALIBRATION_WARNING_ACTIVE, true)
+            outState.putString(
+                STATE_AUTO_CALIBRATION_WARNING_DRAFT,
+                autoStartCalibrationWarningDraft
+            )
+            val remaining = if (autoStartCalibrationWarningDeadline > 0L) {
+                (autoStartCalibrationWarningDeadline - SystemClock.elapsedRealtime())
+                    .coerceAtLeast(0L)
+            } else {
+                0L
+            }
+            outState.putLong(STATE_AUTO_CALIBRATION_WARNING_REMAINING, remaining)
+        }
         super.onSaveInstanceState(outState)
     }
 
@@ -1049,7 +1405,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun cleanupInterruptedFloatingSession(incident: FloatingBallSessionState.Incident) {
-        thread(name = "AppOptFloatingCleanup") {
+        CalibrationCommandDispatcher.execute {
             val calibrationStopped = if (incident.calibrating && incident.targetPkg.isNotBlank()) {
                 DaemonBridge.stopCalibration(incident.targetPkg)
             } else {
@@ -1077,9 +1433,11 @@ class MainActivity : AppCompatActivity() {
     private fun refreshForegroundState(
         refreshConfig: Boolean,
         lifecycleGeneration: Long? = null,
-        forceFullAppListRefresh: Boolean = false
+        forceFullAppListRefresh: Boolean = false,
+        onApplied: (() -> Unit)? = null
     ) {
         if (configMutationInFlight > 0) {
+            onApplied?.invoke()
             return
         }
         foregroundRefreshesInFlight.incrementAndGet()
@@ -1106,6 +1464,14 @@ class MainActivity : AppCompatActivity() {
             }
             val running = runtime.running
             val helperStatus = if (root && compatible && !pendingUpdate) queryForegroundHelperStatus() else ForegroundHelperStatus()
+            val sceneState = if (root && compatible && !pendingUpdate) {
+                DaemonBridge.readSceneCoreAllocationState(
+                    runtime.pid,
+                    helperStatus.state?.sceneInstalled
+                )
+            } else {
+                null
+            }
             val enabled = root && compatible && running
             val config = if (enabled && refreshConfig) ConfigReader.readPackagesOrNull() else null
             val health = if (enabled && refreshConfig) {
@@ -1133,6 +1499,7 @@ class MainActivity : AppCompatActivity() {
                 daemonRunning = running
                 daemonRuntime = runtime
                 foregroundHelperStatus = helperStatus
+                sceneCoreAllocationState = sceneState
                 environmentLoading = false
                 renderEnvironmentOverview()
                 var needsAppListRefresh = false
@@ -1168,9 +1535,21 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     binding.appRefresh.isRefreshing = false
                 }
+                onApplied?.invoke()
+                refreshUsageGuideForEnvironmentState()
                 showModuleWarningIfNeeded()
                 maybeCheckStartupUpdate()
             }
+            } catch (error: Exception) {
+                android.util.Log.e("AppOpt", "foreground refresh failed", error)
+                runOnUiThreadIfEnvironmentCurrent(environmentGeneration, lifecycleGeneration) {
+                    binding.appRefresh.isRefreshing = false
+                    environmentLoading = false
+                    renderEnvironmentOverview()
+                    onApplied?.invoke()
+                    refreshUsageGuideForEnvironmentState()
+                    toast("运行环境刷新失败，请稍后重试")
+                }
             } finally {
                 foregroundRefreshesInFlight.decrementAndGet()
             }
@@ -1475,14 +1854,25 @@ class MainActivity : AppCompatActivity() {
         }
 
         val readyCount = listOf(overlay, usage, hasRoot, daemonReady, helperReady).count { it }
-        status.overviewState.text = if (readyCount == 5) "全部正常" else "${5 - readyCount} 项需要处理"
+        val sceneConflict = sceneCoreAllocationState?.enabled == true
+        status.overviewState.text = when {
+            sceneConflict -> "环境异常"
+            readyCount == 5 -> "全部正常"
+            else -> "${5 - readyCount} 项需要处理"
+        }
         val overviewColor = when {
+            sceneConflict -> R.color.status_warn
             readyCount == 5 -> R.color.status_ok
             !hasRoot -> R.color.status_off
             else -> R.color.status_warn
         }
         setStatusDot(status.dotOverview, overviewColor)
         status.overviewState.setTextColor(ContextCompat.getColor(this, overviewColor))
+    }
+
+    fun onSceneCoreAllocationChanged(state: DaemonBridge.SceneCoreAllocationState) {
+        sceneCoreAllocationState = state
+        renderEnvironmentOverview()
     }
 
     private fun setStatusDot(dot: View, colorRes: Int) {
@@ -1561,29 +1951,94 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun restoreModuleUpdateDialogIfNeeded() {
+        val update = ModuleUpdateDialog.activeUpdate(this) ?: return
+        startupUpdateCheckStarted = true
+        startupUpdateDialogShowing = true
+        binding.root.post {
+            if (activityDestroyed || isFinishing || isDestroyed) return@post
+            val shown = ModuleUpdateDialog.show(
+                activity = this,
+                update = update
+            ) {
+                startupUpdateDialogShowing = false
+                (supportFragmentManager.findFragmentByTag(
+                    topLevelFragmentTag(R.id.navEnvironment)
+                ) as? EnvironmentFragment)?.onModuleUpdateSessionDismissed()
+            }
+            if (!shown && ModuleUpdateDialog.activeUpdate(this) == null) {
+                startupUpdateDialogShowing = false
+            }
+        }
+    }
+
     private fun setAutoStartCalibrationSwitchChecked(checked: Boolean) {
         autoStartCalibrationSwitchUpdating = true
         binding.appSection.autoStartCalibrationSwitch.isChecked = checked
         autoStartCalibrationSwitchUpdating = false
     }
 
-    private fun saveAutoStartCalibrationEnabled(enabled: Boolean) {
+    private fun saveAutoStartCalibrationEnabled(
+        enabled: Boolean,
+        delayMs: Long = autoStartCalibrationDelayMs
+    ) {
         autoStartCalibrationEnabled = enabled
+        autoStartCalibrationDelayMs = AutoStartCalibrationDelay.normalize(delayMs)
         setAutoStartCalibrationSwitchChecked(enabled)
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(PREF_AUTO_START_CALIBRATION, enabled)
+            .putLong(PREF_AUTO_START_CALIBRATION_DELAY_MS, autoStartCalibrationDelayMs)
             .apply()
     }
 
-    private fun showAutoStartCalibrationWarning() {
+    private fun showAutoStartCalibrationWarning(
+        restoredDraft: String? = null,
+        restoredRemainingMs: Long? = null
+    ) {
+        if (autoStartCalibrationWarningDialog?.isShowing == true) return
         autoStartCalibrationWarningTimer?.cancel()
         val view = DialogAutoStartCalibrationWarningBinding.inflate(layoutInflater)
         val dialog = BottomSheetDialog(this)
+        val countdownDuration = restoredRemainingMs
+            ?.coerceIn(0L, AUTO_START_CALIBRATION_WARNING_MS)
+            ?: AUTO_START_CALIBRATION_WARNING_MS
+        var warningCountdownFinished = countdownDuration == 0L
+        var parsedDelayMs: Long? = autoStartCalibrationDelayMs
+
+        fun renderDelay() {
+            val raw = view.autoCalibrationDelayInput.text?.toString()?.trim().orEmpty()
+            parsedDelayMs = AutoStartCalibrationDelay.parse(raw)
+            view.autoCalibrationDelayBox.error = when {
+                raw.isEmpty() -> "请输入延时毫秒数"
+                raw.toLongOrNull() == null -> "只支持输入整数毫秒"
+                parsedDelayMs == null ->
+                    "延时范围为 0-${AutoStartCalibrationDelay.MAX_DELAY_MS} 毫秒"
+                else -> null
+            }
+            view.autoCalibrationDelaySummary.text = parsedDelayMs?.let {
+                AutoStartCalibrationDelay.summary(it)
+            } ?: "输入有效延时后会显示实际启动时间"
+            view.autoCalibrationWarningConfirm.isEnabled =
+                warningCountdownFinished && parsedDelayMs != null
+        }
+
+        autoStartCalibrationWarningDraft = restoredDraft ?: autoStartCalibrationDelayMs.toString()
+        view.autoCalibrationDelayInput.setText(autoStartCalibrationWarningDraft)
+        view.autoCalibrationDelayInput.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                autoStartCalibrationWarningDraft = s?.toString().orEmpty()
+                renderDelay()
+            }
+            override fun afterTextChanged(s: Editable?) = Unit
+        })
+        renderDelay()
         dialog.setCancelable(false)
         dialog.setCanceledOnTouchOutside(false)
         dialog.setContentView(view.root)
         dialog.setOnShowListener {
+            autoStartCalibrationWarningDialog = dialog
             dialog.behavior.apply {
                 state = com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
                 skipCollapsed = true
@@ -1600,35 +2055,51 @@ class MainActivity : AppCompatActivity() {
                     sheet.layoutParams = params
                 }
             }
-            view.autoCalibrationWarningConfirm.isEnabled = false
-            view.autoCalibrationWarningCancel.isEnabled = false
+            view.autoCalibrationWarningConfirm.isEnabled = warningCountdownFinished && parsedDelayMs != null
+            view.autoCalibrationWarningCancel.isEnabled = warningCountdownFinished
             view.autoCalibrationWarningConfirm.setOnClickListener {
-                saveAutoStartCalibrationEnabled(true)
+                val delayMs = parsedDelayMs ?: return@setOnClickListener
+                saveAutoStartCalibrationEnabled(true, delayMs)
                 dialog.dismiss()
             }
             view.autoCalibrationWarningCancel.setOnClickListener {
                 saveAutoStartCalibrationEnabled(false)
                 dialog.dismiss()
             }
-            autoStartCalibrationWarningTimer = object : CountDownTimer(
-                AUTO_START_CALIBRATION_WARNING_MS,
-                1_000L
-            ) {
-                override fun onTick(millisUntilFinished: Long) {
-                    val seconds = ((millisUntilFinished + 999L) / 1_000L).coerceAtLeast(1L)
-                    view.autoCalibrationWarningConfirm.text = "继续开启（${seconds} 秒）"
-                }
+            if (warningCountdownFinished) {
+                autoStartCalibrationWarningDeadline = 0L
+                view.autoCalibrationWarningConfirm.text = "继续开启"
+                renderDelay()
+            } else {
+                autoStartCalibrationWarningDeadline =
+                    SystemClock.elapsedRealtime() + countdownDuration
+                autoStartCalibrationWarningTimer = object : CountDownTimer(
+                    countdownDuration,
+                    1_000L
+                ) {
+                    override fun onTick(millisUntilFinished: Long) {
+                        val seconds = ((millisUntilFinished + 999L) / 1_000L).coerceAtLeast(1L)
+                        view.autoCalibrationWarningConfirm.text = "继续开启（${seconds} 秒）"
+                    }
 
-                override fun onFinish() {
-                    view.autoCalibrationWarningConfirm.text = "继续开启"
-                    view.autoCalibrationWarningConfirm.isEnabled = true
-                    view.autoCalibrationWarningCancel.isEnabled = true
-                }
-            }.also { it.start() }
+                    override fun onFinish() {
+                        warningCountdownFinished = true
+                        autoStartCalibrationWarningDeadline = 0L
+                        view.autoCalibrationWarningConfirm.text = "继续开启"
+                        view.autoCalibrationWarningCancel.isEnabled = true
+                        renderDelay()
+                    }
+                }.also { it.start() }
+            }
         }
         dialog.setOnDismissListener {
             autoStartCalibrationWarningTimer?.cancel()
             autoStartCalibrationWarningTimer = null
+            autoStartCalibrationWarningDialog = null
+            if (!isChangingConfigurations) {
+                autoStartCalibrationWarningDeadline = 0L
+                autoStartCalibrationWarningDraft = null
+            }
         }
         dialog.show()
     }
@@ -1736,6 +2207,15 @@ class MainActivity : AppCompatActivity() {
                 }
                 binding.appRefresh.isRefreshing = false
             }
+            } catch (error: Exception) {
+                android.util.Log.e("AppOpt", "app list refresh failed", error)
+                runOnUiThreadIfAppListCurrent(generation, lifecycleGeneration) {
+                    appListsLoading = false
+                    addableAppsLoading = false
+                    binding.appRefresh.isRefreshing = false
+                    buildAppList()
+                    toast("应用列表刷新失败，请稍后重试")
+                }
             } finally {
                 appListRefreshesInFlight.decrementAndGet()
             }
@@ -1743,6 +2223,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun buildAppList() {
+        binding.root.post(::maybeRestoreRuleDraft)
         val a = binding.appSection
         val blocked = blockedState()
         if (blocked != null) {
@@ -1780,6 +2261,28 @@ class MainActivity : AppCompatActivity() {
         a.emptyState.visibility = View.GONE
         updateEmptyAnimation(false)
         appAdapter.submit(appTab, entries)
+    }
+
+    private fun maybeRestoreRuleDraft() {
+        if (ruleDraftRestoreStarted || activeRuleDraftProvider != null || activityDestroyed ||
+            isFinishing || isDestroyed || blockedState() != null || !hasRoot) {
+            return
+        }
+        val restore = ruleDraftHolder.restore ?: return
+        val entry = appLists.configured.firstOrNull { candidate ->
+            candidate.pkg == restore.entryPkg || restore.entryPkg in candidate.configPkgs
+        } ?: return
+        ruleDraftRestoreStarted = true
+        selectTopLevelPage(R.id.navApps)
+        selectAppTab(AppTab.CONFIGURED)
+        showConfiguredRulesDialog(
+            entry = entry,
+            targets = restore.targets,
+            lines = restore.originalLines,
+            allowedCpus = restore.allowedCpus,
+            health = ruleHealth,
+            restore = restore
+        )
     }
 
     private fun bindEmptyState() {
@@ -2208,6 +2711,37 @@ class MainActivity : AppCompatActivity() {
 
     private fun dp(value: Float): Int {
         return (value * resources.displayMetrics.density + 0.5f).toInt()
+    }
+
+    /** 手机保持贴边底栏；平板/折叠屏把规则面板限制在 560dp 并居中。 */
+    private fun applyResponsiveRuleSheetWidth(
+        dialog: BottomSheetDialog,
+        expand: Boolean = false
+    ) {
+        val sheet = dialog.findViewById<View>(
+            com.google.android.material.R.id.design_bottom_sheet
+        ) ?: return
+        val availableWidth = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            windowManager.currentWindowMetrics.bounds.width()
+        } else {
+            resources.displayMetrics.widthPixels
+        }
+        val params = sheet.layoutParams
+        params.width = if (availableWidth >= dp(600f)) {
+            minOf(dp(560f), (availableWidth - dp(32f)).coerceAtLeast(dp(320f)))
+        } else {
+            ViewGroup.LayoutParams.MATCH_PARENT
+        }
+        if (params is CoordinatorLayout.LayoutParams) {
+            // BottomSheetBehavior 会自行计算纵向偏移，容器必须保持顶部锚定。
+            params.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+        }
+        sheet.layoutParams = params
+        if (expand) {
+            dialog.behavior.state =
+                com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
+            dialog.behavior.skipCollapsed = true
+        }
     }
 
     private fun bindHealthHint(view: TextView, label: String?, description: String?) {
@@ -2786,18 +3320,30 @@ class MainActivity : AppCompatActivity() {
     private fun launchAppWithBall(pkg: String) {
         val launchPkg = packageLookupName(pkg)
         val launch = packageManager.getLaunchIntentForPackage(launchPkg)
+        val svc = Intent(this, FloatingBallService::class.java)
+            .putExtra(FloatingBallService.EXTRA_TARGET_PKG, pkg)
+            .putExtra(FloatingBallService.EXTRA_LAUNCH_PKG, launchPkg)
+            .putExtra(
+                FloatingBallService.EXTRA_AUTO_START_CALIBRATION,
+                autoStartCalibrationEnabled
+            )
+            .putExtra(
+                FloatingBallService.EXTRA_AUTO_START_DELAY_MS,
+                autoStartCalibrationDelayMs
+            )
+            .putExtra(FloatingBallService.EXTRA_MANUAL_LAUNCH, launch == null)
+        try {
+            android.util.Log.d("AppOpt", "startAppWithBall start floating service: pkg=$pkg")
+            startForegroundService(svc)
+        } catch (e: Exception) {
+            android.util.Log.e("AppOpt", "startAppWithBall service failed: $pkg ${e.message}")
+            toast("悬浮球启动失败，请检查后台运行和悬浮窗权限")
+            return
+        }
+
         if (launch != null) {
             launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             try {
-                val svc = Intent(this, FloatingBallService::class.java)
-                    .putExtra(FloatingBallService.EXTRA_TARGET_PKG, pkg)
-                    .putExtra(FloatingBallService.EXTRA_LAUNCH_PKG, launchPkg)
-                    .putExtra(
-                        FloatingBallService.EXTRA_AUTO_START_CALIBRATION,
-                        autoStartCalibrationEnabled
-                    )
-                android.util.Log.d("AppOpt", "startAppWithBall start floating service: pkg=$pkg")
-                startForegroundService(svc)
                 android.util.Log.d("AppOpt", "startAppWithBall launch: launchPkg=$launchPkg configPkg=$pkg")
                 startActivity(launch)
             } catch (e: Exception) {
@@ -2807,8 +3353,8 @@ class MainActivity : AppCompatActivity() {
                 toast("启动 $launchPkg 失败")
             }
         } else {
-            android.util.Log.d("AppOpt", "startAppWithBall blocked: no launcher for $launchPkg")
-            toast("未找到 $launchPkg 的启动入口，请手动进入应用")
+            android.util.Log.d("AppOpt", "startAppWithBall manual launch required: $launchPkg")
+            toast("悬浮球已开启，请手动进入 $launchPkg")
         }
     }
 
@@ -2920,6 +3466,7 @@ class MainActivity : AppCompatActivity() {
         }
         dialog.setContentView(view.root)
         dialog.show()
+        applyResponsiveRuleSheetWidth(dialog)
 
         thread {
             val result = runCatching {
@@ -2978,15 +3525,34 @@ class MainActivity : AppCompatActivity() {
 
         thread {
             try {
-                val ok = DaemonBridge.deleteConfigPackages(pkgs)
-                val removedJankPackages = if (ok) {
-                    pkgs.map(::configOwnerName).map { it.substringBefore(':') }.distinct()
-                } else {
-                    emptyList()
+                val targetJankPackages = pkgs.map(::configOwnerName)
+                    .map { it.substringBefore(':') }
+                    .distinct()
+                val currentJankPackages = DaemonBridge.readJankBoostPackages()
+                val jankSnapshotValid = currentJankPackages != null
+                val enabledTargets = currentJankPackages.orEmpty().intersect(targetJankPackages.toSet())
+                val disabledTargets = mutableListOf<String>()
+                var cleanupOk = jankSnapshotValid
+                if (cleanupOk) {
+                    for (target in enabledTargets) {
+                        if (DaemonBridge.setJankBoostEnabled(target, false)) {
+                            disabledTargets += target
+                        } else {
+                            cleanupOk = false
+                            break
+                        }
+                    }
                 }
-                for (pkg in removedJankPackages) {
-                    if (!DaemonBridge.setJankBoostEnabled(pkg, false)) {
-                        android.util.Log.w("AppOpt", "remove stale jank boost setting failed: $pkg")
+                val configDeleted = cleanupOk && DaemonBridge.deleteConfigPackages(pkgs)
+                val ok = cleanupOk && configDeleted
+                if (!ok) {
+                    for (target in disabledTargets) {
+                        if (!DaemonBridge.setJankBoostEnabled(target, true)) {
+                            android.util.Log.e(
+                                "AppOpt",
+                                "restore jank boost after config delete failure: $target"
+                            )
+                        }
                     }
                 }
                 val config = if (ok) ConfigReader.readPackagesOrNull() else null
@@ -3007,7 +3573,7 @@ class MainActivity : AppCompatActivity() {
                 finishConfigMutation(generation) {
                     addableAppsLoading = false
                     if (ok) {
-                        jankBoostPackages = jankBoostPackages - removedJankPackages.toSet()
+                        jankBoostPackages = jankBoostPackages - targetJankPackages.toSet()
                         updateRuleHealthSnapshot(updatedHealth)
                         processNames = resolvedNames
                         appLists = visibleLists
@@ -3016,7 +3582,13 @@ class MainActivity : AppCompatActivity() {
                     } else {
                         appLists = previousLists
                         buildAppList()
-                        toast("删除配置失败，请检查 Root 或模块权限")
+                        toast(
+                            if (!jankSnapshotValid || !cleanupOk) {
+                                "删除配置失败：掉帧动态调度状态未能安全清理"
+                            } else {
+                                "删除配置失败，请检查 Root 或模块权限"
+                            }
+                        )
                     }
                 }
             } catch (error: Exception) {
@@ -3079,15 +3651,6 @@ class MainActivity : AppCompatActivity() {
                     ?: error("applist.conf read failed")
                 val allowedCpus = DaemonBridge.readConfigAllowedCpus()
                 val health = DaemonBridge.readRuleHealthOrNull() ?: healthSnapshot
-                val historyCandidates = try {
-                    RuleHistoryCandidates.build(
-                        entry.pkg,
-                        AppOptDbHelper.getInstance(this).getRuleHistoryRecordsByPackage(entry.pkg)
-                    )
-                } catch (e: Exception) {
-                    android.util.Log.w("AppOpt", "read rule history candidates failed: ${e.message}")
-                    emptyList()
-                }
                 runOnUiThreadIfAlive {
                     rulesLoadingPackages.remove(entry.pkg)
                     if (!ruleDialogRequests.isCurrent(generation)) return@runOnUiThreadIfAlive
@@ -3105,7 +3668,6 @@ class MainActivity : AppCompatActivity() {
                         targets,
                         lines,
                         allowedCpus,
-                        historyCandidates,
                         currentHealth
                     )
                 }
@@ -3128,21 +3690,27 @@ class MainActivity : AppCompatActivity() {
         targets: List<String>,
         lines: List<String>,
         allowedCpus: Set<Int>,
-        historyCandidates: List<RuleHistoryCandidate>,
-        health: Map<String, DaemonBridge.RuleHealth>
+        health: Map<String, DaemonBridge.RuleHealth>,
+        restore: ConfigRulesRestore? = null
     ) {
-                val rules = lines.mapIndexedNotNull { index, line ->
-                    parseEditableConfigRule(line, index)
+                val draftLines = restore?.draftLines ?: lines.mapIndexed { index, line ->
+                    RuleDraftLine(index, line)
+                }
+                val rules = draftLines.mapNotNull { draft ->
+                    parseEditableConfigRule(draft.line, draft.sourceIndex)
                 }.toMutableList()
-                if (rules.size != lines.size) {
+                if (rules.size != draftLines.size) {
                     toast("部分规则格式无法解析，请检查 applist.conf")
                     return
                 }
-                val initialRuleSnapshot = rules.map { it.asLine() }.sorted()
-                var ruleSearchQuery = ""
-                var ruleFilter = ConfigRuleFilter.ALL
+                val initialRuleSnapshot = lines.map(String::trim).sorted()
+                var ruleSearchQuery = restore?.searchQuery.orEmpty()
+                var ruleFilter = restore?.filter ?: ConfigRuleFilter.ALL
                 var rulesSaving = false
+                var healthResetting = false
                 var currentHealth = health
+                val expandedChildOwners = restore?.expandedChildOwners
+                    ?.toCollection(linkedSetOf()) ?: linkedSetOf()
 
                 val view = DialogConfigRulesBinding.inflate(layoutInflater)
                 view.rulesTitle.text = if (entry.installed) entry.label else entry.pkg
@@ -3160,6 +3728,21 @@ class MainActivity : AppCompatActivity() {
                 view.rulesList.layoutManager = LinearLayoutManager(this)
                 view.rulesList.itemAnimator = null
                 lateinit var renderRules: () -> Unit
+                val ruleDraftToken = Any()
+                activeRuleDraftToken = ruleDraftToken
+                activeRuleDraftProvider = {
+                    ConfigRulesRestore(
+                        entryPkg = entry.pkg,
+                        targets = targets.toList(),
+                        originalLines = lines.toList(),
+                        draftLines = rules.map { RuleDraftLine(it.sourceIndex, it.asLine()) },
+                        allowedCpus = allowedCpus.toSet(),
+                        searchQuery = ruleSearchQuery,
+                        filter = ruleFilter,
+                        expandedChildOwners = expandedChildOwners.toSet(),
+                        editor = activeRuleEditorDraftProvider?.invoke()
+                    )
+                }
                 val adapter = ConfigRuleAdapter(
                     onEdit = { item ->
                         if (!rulesSaving) {
@@ -3169,10 +3752,9 @@ class MainActivity : AppCompatActivity() {
                                     rules[index],
                                     targets,
                                     rules,
-                                    allowedCpus,
-                                    historyCandidates
+                                    allowedCpus
                                 ) { updated ->
-                                    rules[index] = updated
+                                     rules[index] = updated.single()
                                     showRulesError(view, null)
                                     renderRules()
                                 }
@@ -3181,30 +3763,139 @@ class MainActivity : AppCompatActivity() {
                     },
                     onDelete = { item ->
                         if (!rulesSaving) {
-                            confirmDeleteConfigRule(item.rule) {
-                                val index = findEditableRuleIndex(rules, item)
-                                if (index >= 0) {
-                                    rules.removeAt(index)
-                                    showRulesError(view, null)
-                                    renderRules()
+                            item.rule?.let { rule ->
+                                confirmDeleteConfigRule(rule) {
+                                    val index = findEditableRuleIndex(rules, item)
+                                    if (index >= 0) {
+                                        rules.removeAt(index)
+                                        showRulesError(view, null)
+                                        renderRules()
+                                    }
                                 }
                             }
+                        }
+                    },
+                    onExpand = { item ->
+                        if (!rulesSaving && item.kind == ConfigRuleRowKind.CHILD_PROCESS_GROUP) {
+                            if (!expandedChildOwners.add(item.owner)) {
+                                expandedChildOwners.remove(item.owner)
+                            }
+                            renderRules()
                         }
                     }
                 )
                 view.rulesList.adapter = adapter
+                view.rulesList.addOnItemTouchListener(object : RecyclerView.SimpleOnItemTouchListener() {
+                    private val touchSlop = ViewConfiguration.get(this@MainActivity).scaledTouchSlop
+                    private var activeHolder: ConfigRuleAdapter.Holder? = null
+                    private var downX = 0f
+                    private var downY = 0f
+                    private var dragging = false
+
+                    private fun begin(event: MotionEvent, recyclerView: RecyclerView) {
+                        downX = event.x
+                        downY = event.y
+                        dragging = false
+                        activeHolder = recyclerView.findChildViewUnder(event.x, event.y)?.let {
+                            recyclerView.getChildViewHolder(it) as? ConfigRuleAdapter.Holder
+                        }?.takeIf { adapter.canReveal(it.bindingAdapterPosition) }
+                    }
+
+                    private fun update(event: MotionEvent, recyclerView: RecyclerView): Boolean {
+                        val holder = activeHolder ?: return false
+                        val deltaX = event.x - downX
+                        val deltaY = event.y - downY
+                        if (!dragging) {
+                            if (kotlin.math.abs(deltaY) > touchSlop &&
+                                kotlin.math.abs(deltaY) >= kotlin.math.abs(deltaX)
+                            ) {
+                                activeHolder = null
+                                return false
+                            }
+                            if (deltaX >= -touchSlop ||
+                                kotlin.math.abs(deltaX) <= kotlin.math.abs(deltaY)
+                            ) {
+                                return false
+                            }
+                            dragging = true
+                            recyclerView.parent?.requestDisallowInterceptTouchEvent(true)
+                            adapter.closeOtherReveal(holder.bindingAdapterPosition, recyclerView)
+                        }
+                        adapter.applySwipeOffset(holder, deltaX)
+                        return true
+                    }
+
+                    private fun finish(recyclerView: RecyclerView, cancelled: Boolean) {
+                        val holder = activeHolder
+                        if (holder != null && dragging) {
+                            val position = holder.bindingAdapterPosition
+                            val revealDistance = dp(RULE_SWIPE_REVEAL_DP).toFloat()
+                            val shouldReveal = !cancelled &&
+                                holder.binding.ruleForeground.translationX <= -revealDistance * 0.35f
+                            if (shouldReveal && position != RecyclerView.NO_POSITION) {
+                                adapter.revealDelete(position, holder, recyclerView)
+                            } else {
+                                adapter.animateSwipeState(holder, revealed = false)
+                            }
+                        }
+                        recyclerView.parent?.requestDisallowInterceptTouchEvent(false)
+                        activeHolder = null
+                        dragging = false
+                    }
+
+                    override fun onInterceptTouchEvent(
+                        recyclerView: RecyclerView,
+                        event: MotionEvent
+                    ): Boolean {
+                        return when (event.actionMasked) {
+                            MotionEvent.ACTION_DOWN -> {
+                                begin(event, recyclerView)
+                                false
+                            }
+                            MotionEvent.ACTION_MOVE -> update(event, recyclerView)
+                            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                                finish(recyclerView, event.actionMasked == MotionEvent.ACTION_CANCEL)
+                                false
+                            }
+                            else -> dragging
+                        }
+                    }
+
+                    override fun onTouchEvent(recyclerView: RecyclerView, event: MotionEvent) {
+                        when (event.actionMasked) {
+                            MotionEvent.ACTION_MOVE -> update(event, recyclerView)
+                            MotionEvent.ACTION_UP -> finish(recyclerView, cancelled = false)
+                            MotionEvent.ACTION_CANCEL -> finish(recyclerView, cancelled = true)
+                        }
+                    }
+                })
 
                 renderRules = {
                     renderConfigRules(
                         view,
                         rules,
                         ruleSearchQuery,
-                         ruleFilter,
-                         rulesSaving,
-                         currentHealth,
-                         adapter
-                     )
-                 }
+                        ruleFilter,
+                        rulesSaving,
+                        rulesSaving || healthResetting,
+                        currentHealth,
+                        expandedChildOwners,
+                        adapter
+                    )
+                    val hasMissedRules = hasMissedRuleHealth(rules, currentHealth)
+                    view.rulesResetHealth.visibility = if (hasMissedRules || healthResetting) {
+                        View.VISIBLE
+                    } else {
+                        View.GONE
+                    }
+                    view.rulesResetHealth.isEnabled = hasMissedRules &&
+                        !rulesSaving && !healthResetting
+                    view.rulesResetHealth.text = if (healthResetting) {
+                        "正在提交重新检测"
+                    } else {
+                        "重新检测异常规则"
+                    }
+                }
 
                 val healthObserver: (Map<String, DaemonBridge.RuleHealth>) -> Unit = { latest ->
                     currentHealth = latest
@@ -3214,6 +3905,15 @@ class MainActivity : AppCompatActivity() {
                 dialog.setOnDismissListener {
                     if (activeRuleHealthObserver === healthObserver) {
                         activeRuleHealthObserver = null
+                    }
+                    if (activeRuleDraftToken === ruleDraftToken) {
+                        activeRuleDraftProvider = null
+                        activeRuleDraftToken = null
+                        activeRuleEditorDraftProvider = null
+                        activeRuleEditorToken = null
+                        if (!isChangingConfigurations) {
+                            ruleDraftHolder.restore = null
+                        }
                     }
                 }
 
@@ -3237,7 +3937,15 @@ class MainActivity : AppCompatActivity() {
 
                     override fun afterTextChanged(s: Editable?) = Unit
                 })
-                view.rulesFilterGroup.check(R.id.rulesFilterAll)
+                if (ruleSearchQuery.isNotEmpty()) view.rulesSearch.setText(ruleSearchQuery)
+                view.rulesFilterGroup.check(
+                    when (ruleFilter) {
+                        ConfigRuleFilter.MAIN -> R.id.rulesFilterMain
+                        ConfigRuleFilter.CHILD -> R.id.rulesFilterChild
+                        ConfigRuleFilter.THREAD -> R.id.rulesFilterThread
+                        ConfigRuleFilter.ALL -> R.id.rulesFilterAll
+                    }
+                )
                 view.rulesFilterGroup.addOnButtonCheckedListener { _, checkedId, checked ->
                     if (!checked) return@addOnButtonCheckedListener
                     ruleFilter = when (checkedId) {
@@ -3249,16 +3957,45 @@ class MainActivity : AppCompatActivity() {
                     renderRules()
                 }
 
+                view.rulesResetHealth.setOnClickListener {
+                    if (rulesSaving || healthResetting ||
+                        !hasMissedRuleHealth(rules, currentHealth)) {
+                        return@setOnClickListener
+                    }
+                    healthResetting = true
+                    renderRules()
+                    thread {
+                        val ok = DaemonBridge.requestRuleHealthReset(entry.pkg)
+                        runOnUiThreadIfAlive {
+                            if (!dialog.isShowing) return@runOnUiThreadIfAlive
+                            healthResetting = false
+                            if (ok) {
+                                val pendingHealth = DaemonBridge.markRuleHealthResetPending(
+                                    ruleHealth,
+                                    entry.pkg
+                                )
+                                currentHealth = pendingHealth
+                                updateRuleHealthSnapshot(pendingHealth)
+                                markConfiguredRuleHealthPending(entry.pkg)
+                                toast("已设为待检测，下次启动应用时重新观察")
+                                scheduleSettledHealthRefresh()
+                            } else {
+                                renderRules()
+                                toast("重新检测请求失败，请检查 Root 或模块状态")
+                            }
+                        }
+                    }
+                }
+
                 view.rulesAdd.setOnClickListener {
                     if (rulesSaving) return@setOnClickListener
                     showConfigRuleEditor(
                         null,
                         targets,
                         rules,
-                        allowedCpus,
-                        historyCandidates
+                        allowedCpus
                     ) { added ->
-                        rules.add(added)
+                        rules.addAll(added)
                         showRulesError(view, null)
                         renderRules()
                     }
@@ -3298,6 +4035,29 @@ class MainActivity : AppCompatActivity() {
                 }
                  renderRules()
                  dialog.show()
+                 applyResponsiveRuleSheetWidth(dialog, expand = true)
+                restore?.editor?.let { savedEditor ->
+                    view.root.post {
+                        if (!dialog.isShowing || isFinishing || isDestroyed) return@post
+                        val draftIndex = savedEditor.draftIndex
+                        val currentRule = draftIndex?.let(rules::getOrNull)
+                        showConfigRuleEditor(
+                            current = currentRule,
+                            targets = targets,
+                            existingRules = rules,
+                            allowedCpus = allowedCpus,
+                            restore = savedEditor
+                        ) { updated ->
+                            if (currentRule != null && rules.getOrNull(draftIndex) === currentRule) {
+                                rules[draftIndex] = updated.single()
+                            } else {
+                                rules.addAll(updated)
+                            }
+                            showRulesError(view, null)
+                            renderRules()
+                        }
+                    }
+                }
                 scheduleSettledHealthRefresh()
      }
 
@@ -3328,16 +4088,18 @@ class MainActivity : AppCompatActivity() {
         rules: List<EditableConfigRule>,
         target: ConfigRuleListItem
     ): Int {
-        val preferred = rules.getOrNull(target.listIndex)
-        if (preferred === target.rule ||
-            (target.rule.sourceIndex != null && preferred?.sourceIndex == target.rule.sourceIndex)) {
-            return target.listIndex
+        val targetRule = target.rule ?: return -1
+        val targetIndex = target.listIndex ?: -1
+        val preferred = rules.getOrNull(targetIndex)
+        if (preferred === targetRule ||
+            (targetRule.sourceIndex != null && preferred?.sourceIndex == targetRule.sourceIndex)) {
+            return targetIndex
         }
-        val sourceIndex = target.rule.sourceIndex
+        val sourceIndex = targetRule.sourceIndex
         return if (sourceIndex != null) {
             rules.indexOfFirst { it.sourceIndex == sourceIndex }
         } else {
-            rules.indexOfFirst { it === target.rule }
+            rules.indexOfFirst { it === targetRule }
         }
     }
 
@@ -3347,53 +4109,162 @@ class MainActivity : AppCompatActivity() {
         searchQuery: String,
         filter: ConfigRuleFilter,
         saving: Boolean,
+        interactionsLocked: Boolean,
         health: Map<String, DaemonBridge.RuleHealth>,
+        expandedChildOwners: Set<String>,
         adapter: ConfigRuleAdapter
     ) {
         view.rulesCount.text = if (rules.isEmpty()) "暂无规则" else "${rules.size} 条规则"
-        view.rulesSave.isEnabled = rules.isNotEmpty() && !saving
+        view.rulesSave.isEnabled = rules.isNotEmpty() && !interactionsLocked
         view.rulesSave.text = if (saving) "保存中" else "保存"
-        view.rulesClose.isEnabled = !saving
-        view.rulesAdd.isEnabled = !saving
-        view.rulesSearch.isEnabled = !saving
+        view.rulesClose.isEnabled = !interactionsLocked
+        view.rulesAdd.isEnabled = !interactionsLocked
+        view.rulesSearch.isEnabled = !interactionsLocked
         for (index in 0 until view.rulesFilterGroup.childCount) {
-            view.rulesFilterGroup.getChildAt(index).isEnabled = !saving
+            view.rulesFilterGroup.getChildAt(index).isEnabled = !interactionsLocked
         }
 
         val normalizedQuery = searchQuery.lowercase(Locale.ROOT)
         val cpuBoundsByIndex = rules.indices.associateWith { index ->
             RuleConfigLogic.parseCpuBounds(rules[index].cpus)
         }
-        val filteredRules = rules.withIndex()
+        val indexedRules = rules.withIndex().toList()
+        val displayItems = mutableListOf<ConfigRuleListItem>()
+        val mainRules = indexedRules.filterNot { it.value.owner.contains(':') }
             .filter { indexedRule ->
                 val rule = indexedRule.value
                 val typeMatches = when (filter) {
                     ConfigRuleFilter.ALL -> true
-                    ConfigRuleFilter.MAIN -> rule.thread == null && !rule.owner.contains(':')
-                    ConfigRuleFilter.CHILD -> rule.thread == null && rule.owner.contains(':')
+                    ConfigRuleFilter.MAIN -> rule.thread == null
+                    ConfigRuleFilter.CHILD -> false
                     ConfigRuleFilter.THREAD -> rule.thread != null
                 }
                 typeMatches && (normalizedQuery.isEmpty() ||
                     rule.asLine().lowercase(Locale.ROOT).contains(normalizedQuery))
             }
             .sortedWith(configRuleDisplayComparator(cpuBoundsByIndex))
+        mainRules.forEach { indexed ->
+            displayItems += configRuleItem(indexed, health)
+        }
+
+        indexedRules.filter { it.value.owner.contains(':') }
+            .groupBy { it.value.owner }
+            .entries
+            .sortedWith(
+                compareBy<Map.Entry<String, List<IndexedValue<EditableConfigRule>>>> {
+                    it.key.lowercase(Locale.ROOT)
+                }.thenBy { it.key }
+            )
+            .forEach { (owner, ownerRules) ->
+                val fallback = ownerRules.firstOrNull { it.value.thread == null }
+                val threads = ownerRules.filter { it.value.thread != null }
+                    .sortedWith(configRuleDisplayComparator(cpuBoundsByIndex))
+                val filterMatches = when (filter) {
+                    ConfigRuleFilter.ALL, ConfigRuleFilter.CHILD -> true
+                    ConfigRuleFilter.THREAD -> threads.isNotEmpty()
+                    ConfigRuleFilter.MAIN -> false
+                }
+                val matchingThreads = if (normalizedQuery.isEmpty()) threads else threads.filter {
+                    it.value.asLine().lowercase(Locale.ROOT).contains(normalizedQuery)
+                }
+                val groupMatchesQuery = normalizedQuery.isEmpty() ||
+                    owner.lowercase(Locale.ROOT).contains(normalizedQuery) ||
+                    fallback?.value?.asLine()?.lowercase(Locale.ROOT)?.contains(normalizedQuery) == true ||
+                    matchingThreads.isNotEmpty()
+                if (!filterMatches || !groupMatchesQuery) return@forEach
+
+                val expanded = owner in expandedChildOwners ||
+                    (normalizedQuery.isNotEmpty() && matchingThreads.isNotEmpty())
+                displayItems += ConfigRuleListItem(
+                    stableKey = "group:$owner",
+                    listIndex = fallback?.index,
+                    rule = fallback?.value,
+                    health = fallback?.let { indexed ->
+                        DaemonBridge.ruleHealthKey(indexed.value.owner, null)?.let(health::get)
+                    },
+                    kind = ConfigRuleRowKind.CHILD_PROCESS_GROUP,
+                    owner = owner,
+                    childCount = threads.size,
+                    expanded = expanded
+                )
+                if (expanded) {
+                    val visibleThreads = if (normalizedQuery.isEmpty()) threads else matchingThreads
+                    visibleThreads.forEachIndexed { index, indexed ->
+                        displayItems += configRuleItem(
+                            indexed,
+                            health,
+                            ConfigRuleRowKind.CHILD_THREAD,
+                            isLastChild = index == visibleThreads.lastIndex
+                        )
+                    }
+                }
+            }
         val showTools = rules.size >= RULE_TOOLS_THRESHOLD ||
             searchQuery.isNotEmpty() || filter != ConfigRuleFilter.ALL
         view.rulesTools.visibility = if (showTools) View.VISIBLE else View.GONE
         view.rulesFilterSummary.visibility = if (showTools) View.VISIBLE else View.GONE
-        view.rulesFilterSummary.text = "显示 ${filteredRules.size} / ${rules.size}"
+        view.rulesFilterSummary.text = "显示 ${displayItems.size} 项 / ${rules.size} 条规则"
         view.rulesEmpty.text = when {
             rules.isEmpty() -> "暂无绑定规则"
-            filteredRules.isEmpty() -> "没有匹配的规则"
+            displayItems.isEmpty() -> "没有匹配的规则"
             else -> ""
         }
-        view.rulesEmpty.visibility = if (filteredRules.isEmpty()) View.VISIBLE else View.GONE
-        view.rulesList.visibility = if (filteredRules.isEmpty()) View.GONE else View.VISIBLE
-        adapter.interactionsEnabled = !saving
-        adapter.submitList(filteredRules.map {
-            val key = DaemonBridge.ruleHealthKey(it.value.owner, it.value.thread)
-            ConfigRuleListItem(it.index, it.value, key?.let(health::get))
-        })
+        view.rulesEmpty.visibility = if (displayItems.isEmpty()) View.VISIBLE else View.GONE
+        view.rulesList.visibility = if (displayItems.isEmpty()) View.GONE else View.VISIBLE
+        adapter.interactionsEnabled = !interactionsLocked
+        adapter.resetReveal()
+        adapter.submitList(displayItems)
+    }
+
+    private fun hasMissedRuleHealth(
+        rules: List<EditableConfigRule>,
+        health: Map<String, DaemonBridge.RuleHealth>
+    ): Boolean {
+        return rules.any { rule ->
+            val key = DaemonBridge.ruleHealthKey(rule.owner, rule.thread) ?: return@any false
+            health[key]?.status == DaemonBridge.RuleHealthStatus.MISSED
+        }
+    }
+
+    private fun markConfiguredRuleHealthPending(pkg: String) {
+        val basePkg = configOwnerName(pkg)
+        val configured = appLists.configured.map { candidate ->
+            val sameApp = configOwnerName(candidate.pkg) == basePkg ||
+                candidate.configPkgs.any { configOwnerName(it) == basePkg }
+            if (sameApp) {
+                candidate.copy(
+                    missedRuleCount = 0,
+                    pendingReviewRuleCount = 0,
+                    missedRuleKinds = emptySet(),
+                    pendingReviewRuleKinds = emptySet()
+                )
+            } else {
+                candidate
+            }
+        }
+        appLists = appLists.copy(configured = configured)
+        buildAppList()
+    }
+
+    private fun configRuleItem(
+        indexed: IndexedValue<EditableConfigRule>,
+        health: Map<String, DaemonBridge.RuleHealth>,
+        kind: ConfigRuleRowKind = ConfigRuleRowKind.RULE,
+        isLastChild: Boolean = false
+    ): ConfigRuleListItem {
+        val rule = indexed.value
+        val healthKey = DaemonBridge.ruleHealthKey(rule.owner, rule.thread)
+        val identity = rule.sourceIndex?.let { "source:$it" }
+            ?: "new:${rule.owner}\u0000${rule.thread.orEmpty()}"
+        return ConfigRuleListItem(
+            stableKey = identity,
+            listIndex = indexed.index,
+            rule = rule,
+            health = healthKey?.let(health::get),
+            kind = kind,
+            owner = rule.owner,
+            isLastChild = isLastChild
+        )
     }
 
     private fun configRuleDisplayComparator(
@@ -3431,21 +4302,14 @@ class MainActivity : AppCompatActivity() {
 
     private inner class ConfigRuleAdapter(
         private val onEdit: (ConfigRuleListItem) -> Unit,
-        private val onDelete: (ConfigRuleListItem) -> Unit
+        private val onDelete: (ConfigRuleListItem) -> Unit,
+        private val onExpand: (ConfigRuleListItem) -> Unit
     ) : ListAdapter<ConfigRuleListItem, ConfigRuleAdapter.Holder>(
         object : DiffUtil.ItemCallback<ConfigRuleListItem>() {
             override fun areItemsTheSame(
                 oldItem: ConfigRuleListItem,
                 newItem: ConfigRuleListItem
-            ): Boolean {
-                val oldSource = oldItem.rule.sourceIndex
-                val newSource = newItem.rule.sourceIndex
-                return if (oldSource != null && newSource != null) {
-                    oldSource == newSource
-                } else {
-                    oldItem.rule === newItem.rule
-                }
-            }
+            ): Boolean = oldItem.stableKey == newItem.stableKey
 
             override fun areContentsTheSame(
                 oldItem: ConfigRuleListItem,
@@ -3453,6 +4317,9 @@ class MainActivity : AppCompatActivity() {
             ): Boolean = oldItem == newItem
         }
     ) {
+        private var revealedKey: String? = null
+        private var revealedHolder: Holder? = null
+
         var interactionsEnabled: Boolean = true
             set(value) {
                 if (field == value) return
@@ -3460,17 +4327,142 @@ class MainActivity : AppCompatActivity() {
                 notifyItemRangeChanged(0, itemCount)
             }
 
+        fun canReveal(position: Int): Boolean {
+            return interactionsEnabled && position in 0 until itemCount &&
+                getItem(position).rule != null && getItem(position).stableKey != revealedKey
+        }
+
+        fun isRevealed(position: Int): Boolean {
+            return position in 0 until itemCount && getItem(position).stableKey == revealedKey
+        }
+
+        fun resetReveal() {
+            val previousKey = revealedKey
+            val previousHolder = revealedHolder
+            revealedKey = null
+            revealedHolder = null
+            if (previousHolder != null) {
+                animateSwipeState(previousHolder, revealed = false)
+            } else if (previousKey != null) {
+                currentList.indexOfFirst { it.stableKey == previousKey }
+                    .takeIf { it >= 0 }
+                    ?.let(::notifyItemChanged)
+            }
+        }
+
+        fun closeOtherReveal(position: Int, recyclerView: RecyclerView) {
+            val previousKey = revealedKey ?: return
+            if (position in 0 until itemCount && getItem(position).stableKey == previousKey) {
+                return
+            }
+            revealedKey = null
+            val previousPosition = currentList.indexOfFirst { it.stableKey == previousKey }
+            val previousHolder = revealedHolder ?: previousPosition
+                .takeIf { it >= 0 }
+                ?.let { recyclerView.findViewHolderForAdapterPosition(it) as? Holder }
+            revealedHolder = null
+            if (previousHolder != null) {
+                animateSwipeState(previousHolder, revealed = false)
+            } else if (previousPosition >= 0) {
+                notifyItemChanged(previousPosition)
+            }
+        }
+
+        fun revealDelete(position: Int, holder: Holder, recyclerView: RecyclerView) {
+            if (!canReveal(position)) {
+                if (position in 0 until itemCount) notifyItemChanged(position)
+                return
+            }
+            for (index in 0 until recyclerView.childCount) {
+                val otherHolder = recyclerView.getChildViewHolder(
+                    recyclerView.getChildAt(index)
+                ) as? Holder ?: continue
+                if (otherHolder !== holder) {
+                    animateSwipeState(otherHolder, revealed = false)
+                }
+            }
+            revealedKey = getItem(position).stableKey
+            revealedHolder = holder
+            animateSwipeState(holder, revealed = true)
+        }
+
+        private fun closeReveal(item: ConfigRuleListItem, holder: Holder? = null) {
+            if (revealedKey != item.stableKey) return
+            revealedKey = null
+            if (revealedHolder === holder) revealedHolder = null
+            if (holder != null) {
+                animateSwipeState(holder, revealed = false)
+            } else {
+                currentList.indexOfFirst { it.stableKey == item.stableKey }
+                    .takeIf { it >= 0 }
+                    ?.let(::notifyItemChanged)
+            }
+        }
+
+        fun applySwipeOffset(holder: Holder, offset: Float) {
+            val revealDistance = dp(RULE_SWIPE_REVEAL_DP).toFloat()
+            val clamped = offset.coerceIn(-revealDistance, 0f)
+            val foreground = holder.binding.ruleForeground
+            val deleteAction = holder.binding.ruleDeleteAction
+            foreground.animate().cancel()
+            deleteAction.animate().cancel()
+            foreground.translationX = clamped
+            val progress = (-clamped / revealDistance).coerceIn(0f, 1f)
+            deleteAction.visibility = if (progress > 0f) View.VISIBLE else View.INVISIBLE
+            deleteAction.alpha = progress
+            val scale = 0.82f + 0.18f * progress
+            deleteAction.scaleX = scale
+            deleteAction.scaleY = scale
+            deleteAction.isEnabled = false
+        }
+
+        fun animateSwipeState(holder: Holder, revealed: Boolean) {
+            val foreground = holder.binding.ruleForeground
+            val deleteAction = holder.binding.ruleDeleteAction
+            foreground.animate().cancel()
+            deleteAction.animate().cancel()
+            if (revealed) {
+                deleteAction.visibility = View.VISIBLE
+            }
+            deleteAction.isEnabled = interactionsEnabled && revealed
+            foreground.animate()
+                .translationX(if (revealed) -dp(RULE_SWIPE_REVEAL_DP).toFloat() else 0f)
+                .setDuration(RULE_SWIPE_SNAP_MS)
+                .setInterpolator(DecelerateInterpolator(1.8f))
+                .start()
+            deleteAction.animate()
+                .alpha(if (revealed) 1f else 0f)
+                .scaleX(if (revealed) 1f else 0.82f)
+                .scaleY(if (revealed) 1f else 0.82f)
+                .setDuration(if (revealed) 160L else 120L)
+                .setInterpolator(DecelerateInterpolator())
+                .withEndAction {
+                    if (!revealed) deleteAction.visibility = View.INVISIBLE
+                }
+                .start()
+        }
+
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): Holder {
             return Holder(ItemConfigRuleBinding.inflate(layoutInflater, parent, false))
+        }
+
+        override fun onViewRecycled(holder: Holder) {
+            if (revealedHolder === holder) {
+                revealedHolder = null
+            }
+            super.onViewRecycled(holder)
         }
 
         override fun onBindViewHolder(holder: Holder, position: Int) {
             val listItem = getItem(position)
             val rule = listItem.rule
             val item = holder.binding
-            val isThread = rule.thread != null
-            val isChildProcess = !isThread && rule.owner.contains(':')
+            val isGroup = listItem.kind == ConfigRuleRowKind.CHILD_PROCESS_GROUP
+            val isChildThread = listItem.kind == ConfigRuleRowKind.CHILD_THREAD
+            val isThread = isChildThread || rule?.thread != null
+            val isChildProcess = isGroup || (rule?.thread == null && rule?.owner?.contains(':') == true)
             item.ruleType.text = when {
+                isChildThread -> "线程"
                 isThread -> "线程"
                 isChildProcess -> "子进程"
                 else -> "主进程"
@@ -3484,14 +4476,26 @@ class MainActivity : AppCompatActivity() {
                     if (isThread) R.color.brand_primary_dark else R.color.brand_secondary
                 )
             )
+            item.ruleType.visibility = if (isChildThread) View.GONE else View.VISIBLE
             val targetLabel = when {
-                isThread -> rule.thread
-                isChildProcess -> rule.owner.substringAfter(':')
+                isGroup -> listItem.owner.substringAfter(':')
+                isThread -> rule?.thread
+                isChildProcess -> rule?.owner?.substringAfter(':')
                 else -> "主进程"
             }
-            item.ruleOwner.text = rule.owner.substringBefore(':')
+            item.ruleOwner.text = when {
+                isGroup && listItem.childCount > 0 ->
+                    "${listItem.owner} · ${listItem.childCount} 条子线程"
+                isGroup -> listItem.owner
+                isChildThread -> rule?.owner.orEmpty()
+                else -> rule?.owner?.substringBefore(':').orEmpty()
+            }
             val health = listItem.health
-            val healthKindLabel = if (isThread) "线程" else "子进程"
+            val healthKindLabel = when {
+                isChildThread -> "子线程"
+                isThread -> "线程"
+                else -> "子进程"
+            }
             val healthLabel = when {
                 health?.status == DaemonBridge.RuleHealthStatus.MISSED ->
                     "${healthKindLabel}可能无效"
@@ -3513,16 +4517,166 @@ class MainActivity : AppCompatActivity() {
             } ?: targetLabel
             item.ruleTarget.tooltipText = healthDescription
             item.ruleTarget.isSelected = true
-            item.ruleCpus.text = rule.cpus
+            item.ruleCpus.text = rule?.cpus ?: "仅线程"
+            item.ruleTarget.setTextSize(
+                TypedValue.COMPLEX_UNIT_SP,
+                if (isChildThread) 12.5f else 13f
+            )
+            item.ruleOwner.setTextSize(
+                TypedValue.COMPLEX_UNIT_SP,
+                if (isChildThread) 9f else 9.5f
+            )
+            item.ruleContent.setPaddingRelative(
+                if (isChildThread) dp(10f) else dp(8f),
+                item.ruleContent.paddingTop,
+                dp(8f),
+                item.ruleContent.paddingBottom
+            )
+            item.ruleContent.setBackgroundColor(Color.WHITE)
+            item.ruleContent.minimumHeight = dp(if (isChildThread) 50f else 56f)
+
+            val foregroundParams = item.ruleForeground.layoutParams as ViewGroup.MarginLayoutParams
+            foregroundParams.marginStart = if (isChildThread) dp(28f) else 0
+            item.ruleForeground.layoutParams = foregroundParams
+            item.ruleForeground.setCardBackgroundColor(
+                ContextCompat.getColor(this@MainActivity, R.color.card_bg)
+            )
+            item.ruleForeground.backgroundTintList = ColorStateList.valueOf(Color.WHITE)
+            item.ruleForeground.setCardForegroundColor(
+                ColorStateList.valueOf(Color.TRANSPARENT)
+            )
+            item.ruleForeground.strokeColor = ContextCompat.getColor(
+                this@MainActivity,
+                when {
+                    isChildThread -> R.color.rule_child_stroke
+                    else -> R.color.outline_soft
+                }
+            )
+            item.ruleForeground.radius = dp(if (isChildThread) 6f else 8f).toFloat()
+            item.ruleHierarchyGuide.visibility = if (isChildThread) View.VISIBLE else View.GONE
+            item.ruleHierarchyLine.pivotY = 0f
+            item.ruleHierarchyLine.scaleY = if (isChildThread && listItem.isLastChild) 0.5f else 1f
+
+            val rootParams = item.root.layoutParams as? ViewGroup.MarginLayoutParams
+            rootParams?.let {
+                it.bottomMargin = dp(
+                    when {
+                        isGroup && listItem.expanded -> 1f
+                        isChildThread && !listItem.isLastChild -> 1f
+                        else -> 3f
+                    }
+                )
+                item.root.layoutParams = it
+            }
+            val expandable = isGroup && listItem.childCount > 0
+            item.ruleExpand.visibility = if (expandable) View.VISIBLE else View.GONE
+            if (expandable) {
+                item.ruleExpand.setImageResource(
+                    if (listItem.expanded) R.drawable.ic_rule_collapse
+                    else R.drawable.ic_rule_expand
+                )
+                item.ruleExpand.contentDescription =
+                    if (listItem.expanded) "收起子线程" else "展开子线程"
+            }
+            if (expandable) {
+                val action = if (listItem.expanded) "收起子线程" else "展开子线程"
+                item.ruleTarget.contentDescription =
+                    "${item.ruleTarget.contentDescription}，$action"
+            }
+            item.ruleEdit.visibility = if (rule != null) View.VISIBLE else View.GONE
+            val revealed = revealedKey == listItem.stableKey
+            item.ruleForeground.animate().cancel()
+            item.ruleForeground.translationX = if (revealed) {
+                -dp(RULE_SWIPE_REVEAL_DP).toFloat()
+            } else {
+                0f
+            }
+            item.ruleDeleteAction.animate().cancel()
+            item.ruleDeleteAction.isEnabled = interactionsEnabled && rule != null && revealed
+            item.ruleDeleteAction.visibility = if (rule != null && revealed) {
+                View.VISIBLE
+            } else {
+                View.INVISIBLE
+            }
+            item.ruleDeleteAction.alpha = if (revealed) 1f else 0f
+            item.ruleDeleteAction.scaleX = if (revealed) 1f else 0.82f
+            item.ruleDeleteAction.scaleY = if (revealed) 1f else 0.82f
+            if (revealed) {
+                revealedHolder = holder
+            } else if (revealedHolder === holder) {
+                revealedHolder = null
+            }
             item.root.isEnabled = interactionsEnabled
-            item.ruleEdit.isEnabled = interactionsEnabled
-            item.ruleDelete.isEnabled = interactionsEnabled
-            item.root.setOnClickListener { if (interactionsEnabled) onEdit(listItem) }
-            item.ruleEdit.setOnClickListener { if (interactionsEnabled) onEdit(listItem) }
-            item.ruleDelete.setOnClickListener { if (interactionsEnabled) onDelete(listItem) }
+            item.root.isFocusable = interactionsEnabled && rule != null
+            item.ruleEdit.isEnabled = interactionsEnabled && rule != null
+            item.root.accessibilityDelegate = if (rule != null) {
+                object : View.AccessibilityDelegate() {
+                    override fun onInitializeAccessibilityNodeInfo(
+                        host: View,
+                        info: AccessibilityNodeInfo
+                    ) {
+                        super.onInitializeAccessibilityNodeInfo(host, info)
+                        if (interactionsEnabled) {
+                            info.addAction(
+                                AccessibilityNodeInfo.AccessibilityAction(
+                                    R.id.ruleDeleteAction,
+                                    "删除规则"
+                                )
+                            )
+                        }
+                    }
+
+                    override fun performAccessibilityAction(
+                        host: View,
+                        action: Int,
+                        args: Bundle?
+                    ): Boolean {
+                        if (action == R.id.ruleDeleteAction && interactionsEnabled) {
+                            closeReveal(listItem, holder)
+                            onDelete(listItem)
+                            return true
+                        }
+                        return super.performAccessibilityAction(host, action, args)
+                    }
+                }
+            } else {
+                null
+            }
+            item.root.setOnKeyListener { _, keyCode, event ->
+                if (interactionsEnabled && rule != null &&
+                    event.action == KeyEvent.ACTION_UP &&
+                    (keyCode == KeyEvent.KEYCODE_DEL || keyCode == KeyEvent.KEYCODE_FORWARD_DEL)
+                ) {
+                    closeReveal(listItem, holder)
+                    onDelete(listItem)
+                    true
+                } else {
+                    false
+                }
+            }
+            item.ruleContent.setOnClickListener {
+                if (!interactionsEnabled) return@setOnClickListener
+                if (revealedKey == listItem.stableKey) {
+                    closeReveal(listItem, holder)
+                } else if (expandable) {
+                    onExpand(listItem)
+                }
+            }
+            item.ruleEdit.setOnClickListener {
+                if (interactionsEnabled && rule != null) {
+                    closeReveal(listItem, holder)
+                    onEdit(listItem)
+                }
+            }
+            item.ruleDeleteAction.setOnClickListener {
+                if (interactionsEnabled && rule != null) {
+                    closeReveal(listItem, holder)
+                    onDelete(listItem)
+                }
+            }
         }
 
-        private inner class Holder(
+        inner class Holder(
             val binding: ItemConfigRuleBinding
         ) : RecyclerView.ViewHolder(binding.root)
     }
@@ -3530,9 +4684,15 @@ class MainActivity : AppCompatActivity() {
     private fun confirmDeleteConfigRule(rule: EditableConfigRule, onConfirm: () -> Unit) {
         val view = DialogDeleteConfigBinding.inflate(layoutInflater)
         val dialog = BottomSheetDialog(this)
-        view.deleteTitle.text = "删除规则"
+        val childFallback = rule.thread == null && rule.owner.contains(':')
+        view.deleteTitle.text = if (childFallback) "删除子进程兜底" else "删除规则"
         view.deletePkg.text = rule.owner
-        view.deleteRules.text = rule.asLine()
+        view.deleteRules.text = if (childFallback) {
+            "${rule.asLine()}\n\n此操作只删除子进程兜底，已有子线程规则会保留。"
+        } else {
+            rule.asLine()
+        }
+        if (childFallback) view.deleteConfirm.text = "仅删除兜底"
         view.deleteCancel.setOnClickListener { dialog.dismiss() }
         view.deleteConfirm.setOnClickListener {
             dialog.dismiss()
@@ -3540,11 +4700,22 @@ class MainActivity : AppCompatActivity() {
         }
         dialog.setContentView(view.root)
         dialog.show()
+        applyResponsiveRuleSheetWidth(dialog)
     }
 
-    private fun showDiscardRulesConfirm(onDiscard: () -> Unit) {
+    private fun showDiscardRulesConfirm(
+        title: String = "放弃未保存修改",
+        message: String = "规则已经发生变化，但尚未保存。放弃后，本次新增、编辑或删除的内容将丢失。",
+        continueText: String = "继续编辑",
+        confirmText: String = "放弃修改",
+        onDiscard: () -> Unit
+    ) {
         val view = DialogDiscardRulesBinding.inflate(layoutInflater)
         val dialog = BottomSheetDialog(this)
+        view.discardRulesTitle.text = title
+        view.discardRulesMessage.text = message
+        view.discardRulesContinue.text = continueText
+        view.discardRulesConfirm.text = confirmText
         view.discardRulesContinue.setOnClickListener { dialog.dismiss() }
         view.discardRulesConfirm.setOnClickListener {
             dialog.dismiss()
@@ -3558,6 +4729,7 @@ class MainActivity : AppCompatActivity() {
             dialog.behavior.isHideable = false
         }
         dialog.show()
+        applyResponsiveRuleSheetWidth(dialog)
     }
 
     private fun showConfigRuleEditor(
@@ -3565,8 +4737,8 @@ class MainActivity : AppCompatActivity() {
         targets: List<String>,
         existingRules: List<EditableConfigRule>,
         allowedCpus: Set<Int>,
-        historyCandidates: List<RuleHistoryCandidate>,
-        onConfirm: (EditableConfigRule) -> Unit
+        restore: RuleEditorRestore? = null,
+        onConfirm: (List<EditableConfigRule>) -> Unit
     ) {
         val view = DialogConfigRuleEditBinding.inflate(layoutInflater)
         val baseOwner = targets.firstOrNull()?.substringBefore(':').orEmpty()
@@ -3575,18 +4747,17 @@ class MainActivity : AppCompatActivity() {
         view.ruleEditPkg.text = baseOwner
         view.ruleFixedOwnerInput.setText(baseOwner)
         view.ruleChildInput.setText(
-            current?.owner
+            restore?.childSuffix ?: current?.owner
                 ?.takeIf { current.thread == null && it.startsWith("$baseOwner:") }
                 ?.substringAfter(':')
                 .orEmpty()
         )
-        view.ruleThreadInput.setText(current?.thread.orEmpty())
         val currentIsMain = current?.thread == null && current?.owner == baseOwner
         val mainRuleExists = existingRules.any {
             it !== current && it.thread == null && it.owner == baseOwner
         }
         view.ruleTypeMain.visibility = if (mainRuleExists && !currentIsMain) View.GONE else View.VISIBLE
-        val initialType = when {
+        val initialType = restore?.checkedType ?: when {
             current?.thread != null -> R.id.ruleTypeThread
             current?.owner?.contains(':') == true -> R.id.ruleTypeChild
             mainRuleExists -> R.id.ruleTypeChild
@@ -3597,12 +4768,30 @@ class MainActivity : AppCompatActivity() {
             R.id.ruleTypeChild to linkedSetOf(),
             R.id.ruleTypeThread to linkedSetOf()
         )
-        cpuSelections.getValue(initialType).addAll(
-            parseCpuSet(current?.cpus.orEmpty()).filter { it in allowedCpus }
-        )
+        if (restore != null) {
+            restore.cpuSelections.forEach { (type, cpus) ->
+                cpuSelections[type]?.addAll(cpus.filter { it in allowedCpus })
+            }
+        } else {
+            cpuSelections.getValue(initialType).addAll(
+                parseCpuSet(current?.cpus.orEmpty()).filter { it in allowedCpus }
+            )
+        }
         val cpuBoxes = linkedMapOf<Int, MaterialCheckBox>()
         var activeCpuType = initialType
         var suppressCpuChange = false
+
+        data class ThreadEditor(
+            val binding: ItemThreadRuleEditorBinding,
+            var owner: String,
+            val cpus: MutableSet<Int>
+        )
+
+        val threadEditors = mutableListOf<ThreadEditor>()
+        var threadHistoryTarget: ThreadEditor? = null
+        var activeHistoryPicker: BottomSheetDialog? = null
+        val editorClosed = AtomicBoolean(false)
+        val wildcardRequests = RequestGeneration()
 
         fun showCpuWarning(message: String) {
             view.ruleCpuWarning.text = message
@@ -3671,35 +4860,281 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        fun availableHistoryCandidates(type: Int): List<RuleHistoryCandidate> {
-            val kind = when (type) {
-                R.id.ruleTypeChild -> RuleHistoryKind.CHILD_PROCESS
-                R.id.ruleTypeThread -> RuleHistoryKind.THREAD
-                else -> return emptyList()
+        fun updateThreadEditorLabels() {
+            threadEditors.forEachIndexed { index, editor ->
+                editor.binding.threadRuleDivider.visibility =
+                    if (index == 0) View.GONE else View.VISIBLE
+                editor.binding.threadRuleLabel.text = "线程 ${index + 1}"
+                editor.binding.threadRuleOwner.text = if (editor.owner == baseOwner) {
+                    "主进程"
+                } else {
+                    val suffix = editor.owner.removePrefix(baseOwner).removePrefix(":")
+                        .ifBlank { editor.owner }
+                    "子进程 · $suffix"
+                }
+                editor.binding.threadRuleRemove.visibility =
+                    if (current == null && threadEditors.size > 1) View.VISIBLE else View.GONE
             }
-            if (kind == RuleHistoryKind.THREAD && threadOwner != baseOwner) {
-                return emptyList()
-            }
-            val selectedOwner = if (kind == RuleHistoryKind.THREAD) {
-                baseOwner
-            } else {
-                ""
-            }
-            return historyCandidates.filter { candidate ->
-                candidate.kind == kind &&
-                    (kind != RuleHistoryKind.THREAD || candidate.owner == selectedOwner) &&
-                    existingRules.none { rule ->
-                        rule !== current &&
-                            rule.owner == candidate.owner &&
-                            rule.thread == candidate.thread
+            val owners = threadEditors.map { it.owner }.distinct()
+            view.ruleFixedOwnerInput.setText(
+                owners.singleOrNull() ?: "已选择 ${owners.size} 个进程"
+            )
+        }
+
+        fun removeThreadEditor(editor: ThreadEditor) {
+            if (threadEditors.size <= 1 || editor !in threadEditors) return
+            threadEditors.remove(editor)
+            view.ruleThreadGroups.removeView(editor.binding.root)
+            updateThreadEditorLabels()
+            view.ruleEditError.visibility = View.GONE
+        }
+
+        fun addThreadEditor(
+            owner: String,
+            name: String,
+            initialCpus: Set<Int>,
+            requestFocus: Boolean = false
+        ) {
+            val item = ItemThreadRuleEditorBinding.inflate(
+                layoutInflater,
+                view.ruleThreadGroups,
+                false
+            )
+            val selectedCpus = initialCpus.filterTo(linkedSetOf()) { it in allowedCpus }
+            val editor = ThreadEditor(item, owner, selectedCpus)
+            item.threadRuleName.setText(name)
+            item.threadRuleCpuGrid.columnCount = minOf(4, editorCpus.size.coerceAtLeast(1))
+            editorCpus.forEach { cpu ->
+                val box = MaterialCheckBox(this).apply {
+                    text = "CPU$cpu"
+                    textSize = 15f
+                    minHeight = dp(42f)
+                    setPadding(0, 0, dp(8f), 0)
+                    isChecked = cpu in selectedCpus
+                    setOnCheckedChangeListener { button, checked ->
+                        if (checked) {
+                            selectedCpus.add(cpu)
+                        } else if (selectedCpus.size <= 1) {
+                            button.isChecked = true
+                            item.threadRuleCpuError.visibility = View.VISIBLE
+                            return@setOnCheckedChangeListener
+                        } else {
+                            selectedCpus.remove(cpu)
+                        }
+                        item.threadRuleCpuSummary.text =
+                            if (selectedCpus.isEmpty()) "未选择" else formatCpuSet(selectedCpus)
+                        item.threadRuleCpuError.visibility = View.GONE
+                        view.ruleEditError.visibility = View.GONE
                     }
+                }
+                val params = GridLayout.LayoutParams().apply {
+                    width = 0
+                    height = ViewGroup.LayoutParams.WRAP_CONTENT
+                    columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
+                    setMargins(0, dp(1f), 0, dp(1f))
+                }
+                item.threadRuleCpuGrid.addView(box, params)
+            }
+            item.threadRuleCpuSummary.text =
+                if (selectedCpus.isEmpty()) "未选择" else formatCpuSet(selectedCpus)
+            item.threadRuleName.addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(
+                    s: CharSequence?,
+                    start: Int,
+                    count: Int,
+                    after: Int
+                ) = Unit
+
+                override fun onTextChanged(
+                    s: CharSequence?,
+                    start: Int,
+                    before: Int,
+                    count: Int
+                ) {
+                    item.threadRuleNameBox.error = null
+                    view.ruleEditError.visibility = View.GONE
+                }
+
+                override fun afterTextChanged(s: Editable?) = Unit
+            })
+            item.threadRuleNameBox.setEndIconOnClickListener {
+                threadHistoryTarget = editor
+                view.ruleThreadHistory.performClick()
+            }
+            item.threadRuleRemove.setOnClickListener { removeThreadEditor(editor) }
+            threadEditors.add(editor)
+            view.ruleThreadGroups.addView(item.root)
+            updateThreadEditorLabels()
+            if (requestFocus) {
+                item.threadRuleName.post {
+                    item.threadRuleName.requestFocus()
+                    val inputMethod = getSystemService(Context.INPUT_METHOD_SERVICE) as
+                        android.view.inputmethod.InputMethodManager
+                    inputMethod.showSoftInput(
+                        item.threadRuleName,
+                        android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT
+                    )
+                }
             }
         }
 
-        fun selectHistoryCandidate(type: Int) {
-            val candidates = availableHistoryCandidates(type)
-            if (candidates.isEmpty()) return
-            showRuleHistoryPicker(baseOwner, type, candidates) { candidate ->
+        fun resetThreadEditors(targets: List<Pair<String, String>>) {
+            val previousCpus = threadEditors.mapNotNull { editor ->
+                val name = editor.binding.threadRuleName.text?.toString().orEmpty().trim()
+                name.takeIf(String::isNotEmpty)?.let { (editor.owner to it) to editor.cpus.toSet() }
+            }.toMap()
+            val inheritedCpus = threadEditors.firstOrNull()?.cpus
+                ?.toSet()
+                ?: cpuSelections.getValue(R.id.ruleTypeThread).toSet()
+            threadEditors.clear()
+            view.ruleThreadGroups.removeAllViews()
+            targets.distinct().forEach { (owner, name) ->
+                if (name.isNotEmpty()) {
+                    addThreadEditor(owner, name, previousCpus[owner to name] ?: inheritedCpus)
+                }
+            }
+            if (threadEditors.isEmpty()) addThreadEditor(threadOwner, "", inheritedCpus)
+            view.ruleEditError.visibility = View.GONE
+        }
+
+        fun applySelectedThreadTargets(targets: List<Pair<String, String>>) {
+            if (editorClosed.get()) return
+            val targetSet = targets.toSet()
+            val namedEditors = threadEditors.mapNotNull { editor ->
+                val name = editor.binding.threadRuleName.text?.toString().orEmpty().trim()
+                name.takeIf(String::isNotEmpty)?.let { editor.owner to it }
+            }
+            val inheritedCpus = threadEditors.firstOrNull()?.cpus
+                ?.toSet()
+                ?: cpuSelections.getValue(R.id.ruleTypeThread).toSet()
+            val losesNamedInput = namedEditors.any { it !in targetSet }
+            val losesUnnamedCpuEdits = threadEditors.withIndex().any { (index, editor) ->
+                val name = editor.binding.threadRuleName.text?.toString().orEmpty().trim()
+                name.isEmpty() && index > 0 && editor.cpus.toSet() != inheritedCpus
+            }
+            if (!losesNamedInput && !losesUnnamedCpuEdits) {
+                resetThreadEditors(targets)
+                return
+            }
+            showDiscardRulesConfirm(
+                title = "替换当前线程列表",
+                message = "历史多选会替换当前未包含在所选结果中的线程；名称相同的线程保留各自核心，新线程继承线程 1 的核心。",
+                continueText = "返回检查",
+                confirmText = "确认替换"
+            ) {
+                if (!editorClosed.get()) resetThreadEditors(targets)
+            }
+        }
+
+        fun resolveSelectedThreadTargets(
+            selectedCandidates: List<RuleHistoryCandidate>,
+            loadedCandidates: List<RuleHistoryCandidate>,
+            onResolved: (List<Pair<String, String>>) -> Unit
+        ) {
+            val request = wildcardRequests.next()
+            if (selectedCandidates.size > 8) toast("正在整理所选线程")
+            thread(name = "AppOpt-rule-wildcard") {
+                val suggestions = RuleHistoryCandidates.collectThreadWildcardSuggestions(
+                    selectedCandidates,
+                    loadedCandidates
+                )
+                runOnUiThreadIfAlive ui@{
+                    if (editorClosed.get() || !wildcardRequests.isCurrent(request)) return@ui
+                    if (suggestions.isEmpty()) {
+                        onResolved(
+                            RuleHistoryCandidates.resolveThreadTargets(
+                                selectedCandidates,
+                                emptyList()
+                            )
+                        )
+                        return@ui
+                    }
+                    if (selectedCandidates.size == 1) {
+                        val owned = suggestions.first()
+                        showThreadWildcardSuggestion(
+                            suggestion = owned.suggestion,
+                            onSelect = { selectedName ->
+                                val applied = if (selectedName == owned.suggestion.pattern) {
+                                    listOf(owned)
+                                } else {
+                                    emptyList()
+                                }
+                                onResolved(
+                                    RuleHistoryCandidates.resolveThreadTargets(
+                                        selectedCandidates,
+                                        applied
+                                    )
+                                )
+                            },
+                            onClose = {
+                                onResolved(
+                                    RuleHistoryCandidates.resolveThreadTargets(
+                                        selectedCandidates,
+                                        emptyList()
+                                    )
+                                )
+                            }
+                        )
+                        return@ui
+                    }
+                    showThreadWildcardBatchSuggestions(
+                        baseOwner = baseOwner,
+                        selectedCount = selectedCandidates.size,
+                        suggestions = suggestions
+                    ) { applied ->
+                        onResolved(
+                            RuleHistoryCandidates.resolveThreadTargets(
+                                selectedCandidates,
+                                applied
+                            )
+                        )
+                    }
+                }
+            }
+        }
+
+        fun selectHistoryCandidate(type: Int, targetEditor: ThreadEditor? = null) {
+            val multiSelect = current == null && type == R.id.ruleTypeThread && targetEditor == null
+            val excludedTargets = existingRules
+                .asSequence()
+                .filter { it !== current }
+                .map { it.owner to it.thread }
+                .toMutableSet()
+            if (type == R.id.ruleTypeThread && targetEditor != null) {
+                threadEditors.asSequence()
+                    .filter { it !== targetEditor }
+                    .map {
+                        it.owner to it.binding.threadRuleName.text?.toString().orEmpty().trim()
+                    }
+                    .filter { it.second.isNotEmpty() }
+                    .forEach(excludedTargets::add)
+            }
+            activeHistoryPicker = showRuleHistoryPicker(
+                baseOwner = baseOwner,
+                type = type,
+                ownerHint = threadOwner,
+                multiSelect = multiSelect,
+                isOwnerActive = { !editorClosed.get() },
+                loadCandidates = {
+                    val kind = if (type == R.id.ruleTypeChild) {
+                        RuleHistoryKind.CHILD_PROCESS
+                    } else {
+                        RuleHistoryKind.THREAD
+                    }
+                    RuleHistoryCandidates.build(
+                        baseOwner,
+                        AppOptDbHelper.getInstance(applicationContext)
+                            .getRuleHistoryRecordsByPackage(baseOwner)
+                    ).filter { candidate ->
+                        candidate.kind == kind &&
+                            (kind != RuleHistoryKind.THREAD || current?.thread == null ||
+                                candidate.owner == threadOwner) &&
+                            (candidate.owner to candidate.thread) !in excludedTargets
+                    }
+                }
+            ) historySelected@{ selectedCandidates, loadedCandidates ->
+                if (editorClosed.get()) return@historySelected
+                val candidate = selectedCandidates.firstOrNull() ?: return@historySelected
                 when (candidate.kind) {
                     RuleHistoryKind.CHILD_PROCESS -> {
                         view.ruleChildInput.setText(
@@ -3708,21 +5143,35 @@ class MainActivity : AppCompatActivity() {
                         view.ruleChildBox.error = null
                     }
                     RuleHistoryKind.THREAD -> {
-                        val mainThreadCandidates = historyCandidates.filter {
-                            it.kind == RuleHistoryKind.THREAD && it.owner == baseOwner
+                        if (multiSelect) {
+                            resolveSelectedThreadTargets(
+                                selectedCandidates,
+                                loadedCandidates,
+                                ::applySelectedThreadTargets
+                            )
+                            return@historySelected
+                        }
+                        val sameOwnerThreadCandidates = loadedCandidates.filter {
+                            it.kind == RuleHistoryKind.THREAD && it.owner == candidate.owner
                         }
                         val suggestion = RuleHistoryCandidates.suggestThreadWildcard(
                             candidate,
-                            mainThreadCandidates
+                            sameOwnerThreadCandidates
                         )
+                        fun applySingleThread(name: String) {
+                            if (editorClosed.get()) return
+                            val editor = targetEditor ?: threadEditors.firstOrNull() ?: return
+                            editor.owner = candidate.owner
+                            editor.binding.threadRuleName.setText(name)
+                            editor.binding.threadRuleNameBox.error = null
+                            updateThreadEditorLabels()
+                            view.ruleEditError.visibility = View.GONE
+                        }
                         if (suggestion == null) {
-                            view.ruleThreadInput.setText(candidate.thread.orEmpty())
-                            view.ruleThreadBox.error = null
+                            applySingleThread(candidate.thread.orEmpty())
                         } else {
                             showThreadWildcardSuggestion(suggestion) { selectedName ->
-                                view.ruleThreadInput.setText(selectedName)
-                                view.ruleThreadBox.error = null
-                                view.ruleEditError.visibility = View.GONE
+                                applySingleThread(selectedName)
                             }
                         }
                     }
@@ -3734,29 +5183,71 @@ class MainActivity : AppCompatActivity() {
         fun updateType(checkedId: Int) {
             val childMode = checkedId == R.id.ruleTypeChild
             val threadMode = checkedId == R.id.ruleTypeThread
-            view.ruleFixedOwnerBox.visibility = if (childMode) View.GONE else View.VISIBLE
-            view.ruleFixedOwnerInput.setText(if (threadMode) threadOwner else baseOwner)
+            view.ruleFixedOwnerBox.visibility =
+                if (childMode || threadMode) View.GONE else View.VISIBLE
+            if (threadMode) updateThreadEditorLabels() else view.ruleFixedOwnerInput.setText(baseOwner)
             view.ruleChildBox.visibility = if (childMode) View.VISIBLE else View.GONE
-            view.ruleThreadBox.visibility = if (threadMode) View.VISIBLE else View.GONE
+            view.ruleThreadArea.visibility = if (threadMode) View.VISIBLE else View.GONE
+            view.ruleCpuHeader.visibility = if (threadMode) View.GONE else View.VISIBLE
+            view.ruleCpuGridContainer.visibility = if (threadMode) View.GONE else View.VISIBLE
+            view.ruleThreadAdd.visibility =
+                if (threadMode && current == null) View.VISIBLE else View.GONE
             view.ruleChildBox.error = null
-            view.ruleThreadBox.error = null
-            view.ruleChildBox.isEndIconVisible = childMode &&
-                availableHistoryCandidates(R.id.ruleTypeChild).isNotEmpty()
-            view.ruleThreadBox.isEndIconVisible = threadMode &&
-                availableHistoryCandidates(R.id.ruleTypeThread).isNotEmpty()
-            showCpuSelection(checkedId)
+            view.ruleChildBox.isEndIconVisible = childMode
+            view.ruleCpuWarning.visibility = View.GONE
+            if (!threadMode) showCpuSelection(checkedId)
         }
 
         view.ruleChildBox.setEndIconOnClickListener {
             selectHistoryCandidate(R.id.ruleTypeChild)
         }
-        view.ruleThreadBox.setEndIconOnClickListener {
-            selectHistoryCandidate(R.id.ruleTypeThread)
+        view.ruleThreadHistory.text = if (current == null) "历史多选" else "历史选择"
+        view.ruleThreadHistory.setOnClickListener {
+            val target = threadHistoryTarget
+            threadHistoryTarget = null
+            selectHistoryCandidate(R.id.ruleTypeThread, target)
+        }
+        view.ruleThreadAdd.setOnClickListener {
+            val inherited = threadEditors.lastOrNull()?.cpus?.toSet()
+                ?: cpuSelections.getValue(R.id.ruleTypeThread).toSet()
+            addThreadEditor(baseOwner, "", inherited, requestFocus = true)
+        }
+        if (restore?.threads?.isNotEmpty() == true) {
+            restore.threads.forEach { saved ->
+                addThreadEditor(saved.owner, saved.name, saved.cpus)
+            }
+        } else {
+            addThreadEditor(
+                owner = threadOwner,
+                name = current?.thread.orEmpty(),
+                initialCpus = cpuSelections.getValue(R.id.ruleTypeThread)
+            )
         }
         view.ruleTypeGroup.check(initialType)
         updateType(initialType)
         view.ruleTypeGroup.addOnButtonCheckedListener { _, checkedId, checked ->
             if (checked) updateType(checkedId)
+        }
+
+        val editorToken = Any()
+        activeRuleEditorToken = editorToken
+        activeRuleEditorDraftProvider = {
+            RuleEditorRestore(
+                sourceIndex = current?.sourceIndex,
+                draftIndex = current?.let { rule ->
+                    existingRules.indexOfFirst { it === rule }.takeIf { it >= 0 }
+                },
+                checkedType = view.ruleTypeGroup.checkedButtonId,
+                childSuffix = view.ruleChildInput.text?.toString().orEmpty(),
+                cpuSelections = cpuSelections.mapValues { it.value.toSet() },
+                threads = threadEditors.map { editor ->
+                    ThreadEditorRestore(
+                        owner = editor.owner,
+                        name = editor.binding.threadRuleName.text?.toString().orEmpty(),
+                        cpus = editor.cpus.toSet()
+                    )
+                }
+            )
         }
 
         val dialog = BottomSheetDialog(this)
@@ -3768,69 +5259,113 @@ class MainActivity : AppCompatActivity() {
             dialog.behavior.skipCollapsed = true
             dialog.behavior.isHideable = false
         }
+        dialog.setOnDismissListener {
+            editorClosed.set(true)
+            wildcardRequests.next()
+            activeHistoryPicker?.takeIf { it.isShowing }?.dismiss()
+            activeHistoryPicker = null
+            if (activeRuleEditorToken === editorToken && !isChangingConfigurations) {
+                activeRuleEditorDraftProvider = null
+                activeRuleEditorToken = null
+            }
+        }
         view.ruleEditCancel.setOnClickListener { dialog.dismiss() }
         view.ruleEditConfirm.setOnClickListener {
             view.ruleChildBox.error = null
-            view.ruleThreadBox.error = null
+            threadEditors.forEach {
+                it.binding.threadRuleNameBox.error = null
+                it.binding.threadRuleCpuError.visibility = View.GONE
+            }
             view.ruleCpuWarning.visibility = View.GONE
             view.ruleEditError.visibility = View.GONE
 
             val checkedType = view.ruleTypeGroup.checkedButtonId
-            val cpus = formatCpuSet(cpuSelections.getValue(checkedType))
+            val cpus = RuleConfigLogic.formatCpuRangeList(cpuSelections.getValue(checkedType))
             val isChild = checkedType == R.id.ruleTypeChild
             val isThread = checkedType == R.id.ruleTypeThread
             val childSuffix = view.ruleChildInput.text?.toString().orEmpty()
                 .trim()
                 .removePrefix("$baseOwner:")
                 .removePrefix(":")
-            val threadName = view.ruleThreadInput.text?.toString().orEmpty().trim()
+            val threadEntries = threadEditors.map { editor ->
+                Triple(
+                    editor.owner,
+                    editor.binding.threadRuleName.text?.toString().orEmpty().trim(),
+                    RuleConfigLogic.formatCpuRangeList(editor.cpus)
+                )
+            }
+            val threadNames = threadEntries.map { it.second }
             val owner = when {
                 isChild -> "$baseOwner:$childSuffix"
                 isThread -> threadOwner
                 else -> baseOwner
             }
             when {
-                baseOwner.isEmpty() || (!isChild && !RuleConfigLogic.ownerFitsNativeBuffer(owner)) -> {
+                baseOwner.isEmpty() ||
+                    (isThread && threadEntries.any { !RuleConfigLogic.ownerFitsNativeBuffer(it.first) }) ||
+                    (!isChild && !isThread && !RuleConfigLogic.ownerFitsNativeBuffer(owner)) -> {
                     view.ruleEditError.text = "未识别到当前应用主进程"
                     view.ruleEditError.visibility = View.VISIBLE
                     return@setOnClickListener
                 }
-                isChild && (childSuffix.isEmpty() || childSuffix.length > 63 ||
-                    !RuleConfigLogic.ownerFitsNativeBuffer(owner)) -> {
-                    view.ruleChildBox.error = "请输入不超过 63 个字符的子进程后缀"
+                isChild && childSuffix.isEmpty() -> {
+                    view.ruleChildBox.error = "请输入子进程后缀"
                     return@setOnClickListener
                 }
-                isChild && childSuffix.any { it.isWhitespace() || it == ':' || it == '{' || it == '}' || it == '=' } -> {
-                    view.ruleChildBox.error = "子进程后缀不能包含空格、冒号或 { } ="
+                isChild && !RuleConfigLogic.ownerFitsNativeBuffer(owner) -> {
+                    view.ruleChildBox.error = "完整子进程名称不能超过 127 字节"
                     return@setOnClickListener
                 }
-                isThread && threadName.isEmpty() -> {
-                    view.ruleThreadBox.error = "请输入线程名称"
+                isChild && childSuffix.any { it.isWhitespace() || it == '{' || it == '}' || it == '=' } -> {
+                    view.ruleChildBox.error = "子进程后缀不能包含空格或 { } ="
                     return@setOnClickListener
                 }
-                isThread && (threadName.length > 31 ||
-                    !RuleConfigLogic.threadFitsNativeBuffer(threadName) ||
-                    threadName.any { it == '{' || it == '}' || it == '=' }) -> {
-                    view.ruleThreadBox.error = "线程名称不能超过 31 个字符或包含 { } ="
+                isThread && threadNames.any(String::isEmpty) -> {
+                    threadEditors.firstOrNull {
+                        it.binding.threadRuleName.text?.toString().orEmpty().trim().isEmpty()
+                    }?.binding?.threadRuleNameBox?.error = "请输入线程名称"
                     return@setOnClickListener
                 }
-                cpus.isEmpty() -> {
+                isThread && threadNames.any { name ->
+                    name.length > 31 || !RuleConfigLogic.threadFitsNativeBuffer(name) ||
+                        name.any { it == '{' || it == '}' || it == '=' }
+                } -> {
+                    threadEditors.firstOrNull { editor ->
+                        val name = editor.binding.threadRuleName.text?.toString().orEmpty().trim()
+                        name.length > 31 || !RuleConfigLogic.threadFitsNativeBuffer(name) ||
+                            name.any { it == '{' || it == '}' || it == '=' }
+                    }?.binding?.threadRuleNameBox?.error =
+                        "线程名称不能超过 31 个字符或包含 { } ="
+                    return@setOnClickListener
+                }
+                isThread && threadEntries.any { it.third.isEmpty() } -> {
+                    threadEditors.firstOrNull { it.cpus.isEmpty() }
+                        ?.binding?.threadRuleCpuError?.visibility = View.VISIBLE
+                    return@setOnClickListener
+                }
+                !isThread && cpus.isEmpty() -> {
                     showCpuWarning("至少选择一个核心")
                     return@setOnClickListener
                 }
             }
 
-            val rule = EditableConfigRule(
-                sourceIndex = current?.sourceIndex,
-                owner = owner,
-                thread = threadName.takeIf { isThread },
-                cpus = cpus
-            )
-            val targetChanged = current == null ||
-                current.owner != rule.owner || current.thread != rule.thread
-            val duplicate = targetChanged && existingRules.any {
-                it !== current && it.owner == rule.owner && it.thread == rule.thread
+            val newRules = if (isThread) {
+                threadEntries.mapIndexed { index, (targetOwner, threadName, threadCpus) ->
+                    EditableConfigRule(
+                        sourceIndex = if (current != null && index == 0) current.sourceIndex else null,
+                        owner = targetOwner,
+                        thread = threadName,
+                        cpus = threadCpus
+                    )
+                }
+            } else {
+                listOf(EditableConfigRule(current?.sourceIndex, owner, null, cpus))
             }
+            val duplicate = newRules.any { rule ->
+                existingRules.any {
+                    it !== current && it.owner == rule.owner && it.thread == rule.thread
+                }
+            } || newRules.map { it.owner to it.thread }.distinct().size != newRules.size
             if (duplicate) {
                 view.ruleEditError.text = "规则已存在"
                 view.ruleEditError.visibility = View.VISIBLE
@@ -3838,7 +5373,7 @@ class MainActivity : AppCompatActivity() {
             }
             val check = DaemonBridge.validateConfigRulesForPackages(
                 targets,
-                rule.asLine(),
+                newRules.joinToString("\n") { it.asLine() },
                 allowedCpus.takeIf { it.isNotEmpty() }
             )
             when {
@@ -3850,7 +5385,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 check.validLines.isEmpty() -> view.ruleEditError.text = "规则内容为空"
                 else -> {
-                    onConfirm(rule)
+                    onConfirm(newRules)
                     dialog.dismiss()
                     return@setOnClickListener
                 }
@@ -3858,32 +5393,65 @@ class MainActivity : AppCompatActivity() {
             view.ruleEditError.visibility = View.VISIBLE
         }
         dialog.show()
+        applyResponsiveRuleSheetWidth(dialog, expand = true)
     }
 
     private fun showRuleHistoryPicker(
         baseOwner: String,
         type: Int,
-        candidates: List<RuleHistoryCandidate>,
-        onSelect: (RuleHistoryCandidate) -> Unit
-    ) {
+        ownerHint: String,
+        multiSelect: Boolean = false,
+        isOwnerActive: () -> Boolean = { true },
+        loadCandidates: () -> List<RuleHistoryCandidate>,
+        onSelect: (List<RuleHistoryCandidate>, List<RuleHistoryCandidate>) -> Unit
+    ): BottomSheetDialog {
         val view = DialogRuleHistoryPickerBinding.inflate(layoutInflater)
         val dialog = BottomSheetDialog(this)
-        val adapter = RuleHistoryAdapter(baseOwner) { candidate ->
-            dialog.dismiss()
-            mainHandler.post { onSelect(candidate) }
+        val cancelled = AtomicBoolean(false)
+        var candidates: List<RuleHistoryCandidate> = emptyList()
+        val selected = linkedSetOf<String>()
+        val adapter = RuleHistoryAdapter(baseOwner, multiSelect, selected) { candidate ->
+            if (!isOwnerActive()) {
+                dialog.dismiss()
+            } else if (!multiSelect) {
+                val loadedSnapshot = candidates
+                dialog.dismiss()
+                mainHandler.post {
+                    if (isOwnerActive()) onSelect(listOf(candidate), loadedSnapshot)
+                }
+            } else {
+                view.ruleHistoryConfirm.visibility = View.VISIBLE
+                view.ruleHistoryConfirm.text = "添加选中线程（${selected.size}）"
+                view.ruleHistoryConfirm.isEnabled = selected.isNotEmpty()
+            }
         }
-        view.ruleHistoryTitle.text = when {
+        fun pickerTitle(): String = when {
+            multiSelect -> "选择线程（可多选）"
             type == R.id.ruleTypeChild -> "选择历史子进程"
-            candidates.firstOrNull()?.owner == baseOwner -> "选择主进程线程"
+            ownerHint == baseOwner -> "选择主进程线程"
             else -> {
-                val owner = candidates.firstOrNull()?.owner.orEmpty()
-                val suffix = owner.removePrefix(baseOwner).ifBlank { owner }
+                val suffix = ownerHint.removePrefix(baseOwner).ifBlank { ownerHint }
                 "选择 $suffix 线程"
             }
+        }
+        view.ruleHistoryTitle.text = pickerTitle()
+        view.ruleHistoryMeta.text = if (multiSelect) {
+            "正在读取最近 3 次校准记录 · 最多选择 $MAX_RULE_HISTORY_SELECTION 个"
+        } else {
+            "正在读取最近 3 次校准记录"
         }
         view.ruleHistoryList.layoutManager = LinearLayoutManager(this)
         view.ruleHistoryList.adapter = adapter
         view.ruleHistoryList.itemAnimator = null
+        view.ruleHistoryList.visibility = View.GONE
+        view.ruleHistoryEmpty.visibility = View.GONE
+        view.ruleHistoryLoading.visibility = View.VISIBLE
+        view.ruleHistorySearchBox.isEnabled = false
+        if (multiSelect) {
+            view.ruleHistoryConfirm.visibility = View.VISIBLE
+            view.ruleHistoryConfirm.text = "添加选中线程（0）"
+            view.ruleHistoryConfirm.isEnabled = false
+        }
 
         fun renderFilter() {
             val query = view.ruleHistorySearch.text?.toString().orEmpty().trim().lowercase(Locale.ROOT)
@@ -3897,23 +5465,44 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             adapter.submit(filtered)
-            view.ruleHistoryMeta.text = if (filtered.size == candidates.size) {
-                "全部历史去重后 ${candidates.size} 个候选"
+            val summary = if (filtered.size == candidates.size) {
+                "最近记录去重后 ${candidates.size} 个候选"
             } else {
                 "匹配 ${filtered.size} / ${candidates.size} 个候选"
+            }
+            view.ruleHistoryMeta.text = if (multiSelect) {
+                "$summary · 最多选择 $MAX_RULE_HISTORY_SELECTION 个"
+            } else {
+                summary
             }
             view.ruleHistoryEmpty.visibility = if (filtered.isEmpty()) View.VISIBLE else View.GONE
             view.ruleHistoryList.visibility = if (filtered.isEmpty()) View.GONE else View.VISIBLE
         }
 
+        var pendingFilter: Runnable? = null
         view.ruleHistorySearch.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
-                renderFilter()
+                pendingFilter?.let(mainHandler::removeCallbacks)
+                pendingFilter = Runnable {
+                    if (!cancelled.get() && dialog.isShowing) renderFilter()
+                }.also { mainHandler.postDelayed(it, 120L) }
             }
             override fun afterTextChanged(s: Editable?) = Unit
         })
         view.ruleHistoryCancel.setOnClickListener { dialog.dismiss() }
+        view.ruleHistoryConfirm.setOnClickListener {
+            val chosen = candidates.filter {
+                "${it.kind}|${it.owner}|${it.thread.orEmpty()}" in selected
+            }
+            if (chosen.isNotEmpty()) {
+                val loadedSnapshot = candidates
+                dialog.dismiss()
+                mainHandler.post {
+                    if (isOwnerActive()) onSelect(chosen, loadedSnapshot)
+                }
+            }
+        }
         dialog.setCancelable(false)
         dialog.setCanceledOnTouchOutside(false)
         dialog.setContentView(view.root)
@@ -3922,12 +5511,137 @@ class MainActivity : AppCompatActivity() {
             dialog.behavior.skipCollapsed = true
             dialog.behavior.isHideable = false
         }
-        renderFilter()
+        dialog.setOnDismissListener {
+            cancelled.set(true)
+            pendingFilter?.let(mainHandler::removeCallbacks)
+        }
         dialog.show()
+        applyResponsiveRuleSheetWidth(dialog)
+
+        thread(name = "AppOpt-rule-history") {
+            val result = runCatching(loadCandidates)
+            runOnUiThreadIfAlive {
+                if (cancelled.get() || !dialog.isShowing || !isOwnerActive()) {
+                    if (dialog.isShowing) dialog.dismiss()
+                    return@runOnUiThreadIfAlive
+                }
+                view.ruleHistoryLoading.visibility = View.GONE
+                view.ruleHistorySearchBox.isEnabled = true
+                result.fold(
+                    onSuccess = { loaded ->
+                        candidates = loaded.take(RuleHistoryCandidates.MAX_EDITOR_CANDIDATES)
+                        view.ruleHistoryEmpty.text = "没有可用的历史记录"
+                        renderFilter()
+                    },
+                    onFailure = { error ->
+                        android.util.Log.e(
+                            "AppOpt",
+                            "read rule history candidates failed: $baseOwner",
+                            error
+                        )
+                        view.ruleHistoryMeta.text = "历史记录读取失败"
+                        view.ruleHistoryEmpty.text = "读取失败，请返回后重试"
+                        view.ruleHistoryEmpty.visibility = View.VISIBLE
+                        view.ruleHistoryList.visibility = View.GONE
+                    }
+                )
+            }
+        }
+        return dialog
+    }
+
+    private fun showThreadWildcardBatchSuggestions(
+        baseOwner: String,
+        selectedCount: Int,
+        suggestions: List<OwnedThreadWildcardSuggestion>,
+        onSelect: (List<OwnedThreadWildcardSuggestion>) -> Unit
+    ) {
+        val view = DialogThreadWildcardBatchBinding.inflate(layoutInflater)
+        val dialog = BottomSheetDialog(this)
+        val checkedKeys = linkedSetOf<String>()
+
+        fun keyOf(owned: OwnedThreadWildcardSuggestion): String =
+            "${owned.owner}\u0000${owned.suggestion.pattern}"
+
+        fun updateAction() {
+            view.wildcardBatchApply.text = "应用所选建议（${checkedKeys.size}）"
+        }
+
+        view.wildcardBatchMeta.text =
+            "已选 $selectedCount 个线程，发现 ${suggestions.size} 组通配符建议"
+        suggestions.forEach { owned ->
+            val item = ItemThreadWildcardChoiceBinding.inflate(
+                layoutInflater,
+                view.wildcardBatchList,
+                false
+            )
+            val key = keyOf(owned)
+            checkedKeys.add(key)
+            item.wildcardChoicePattern.text = owned.suggestion.pattern
+            val scope = if (owned.owner == baseOwner) {
+                "主进程"
+            } else {
+                "子进程 ${owned.owner.removePrefix(baseOwner).removePrefix(":")}"
+            }
+            val preview = owned.suggestion.matchedNames.take(2).joinToString("、")
+            val remaining = owned.suggestion.matchedNames.size - 2
+            item.wildcardChoiceMeta.text = buildString {
+                append(scope)
+                append(" · 匹配 ${owned.suggestion.matchedNames.size} 个：")
+                append(preview)
+                if (remaining > 0) append(" 等 $remaining 个")
+            }
+            item.wildcardChoiceCheck.isChecked = true
+            item.wildcardChoiceCheck.setOnCheckedChangeListener { _, checked ->
+                if (checked) checkedKeys.add(key) else checkedKeys.remove(key)
+                updateAction()
+            }
+            item.root.setOnClickListener {
+                item.wildcardChoiceCheck.isChecked = !item.wildcardChoiceCheck.isChecked
+            }
+            view.wildcardBatchList.addView(item.root)
+        }
+        view.wildcardBatchScroll.layoutParams = view.wildcardBatchScroll.layoutParams.apply {
+            height = minOf(dp(310f), dp((suggestions.size * 68).toFloat()))
+        }
+        updateAction()
+
+        fun finish(applied: List<OwnedThreadWildcardSuggestion>) {
+            dialog.dismiss()
+            mainHandler.post { onSelect(applied) }
+        }
+
+        view.wildcardBatchClose.setOnClickListener { finish(emptyList()) }
+        view.wildcardBatchKeepExact.setOnClickListener { finish(emptyList()) }
+        view.wildcardBatchApply.setOnClickListener {
+            finish(suggestions.filter { keyOf(it) in checkedKeys })
+        }
+        dialog.setCancelable(false)
+        dialog.setCanceledOnTouchOutside(false)
+        dialog.setContentView(view.root)
+        dialog.setOnShowListener {
+            dialog.behavior.state =
+                com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
+            dialog.behavior.skipCollapsed = true
+            dialog.behavior.isHideable = false
+            dialog.findViewById<View>(com.google.android.material.R.id.design_bottom_sheet)?.let { sheet ->
+                if (resources.configuration.smallestScreenWidthDp >= 600) {
+                    val params = sheet.layoutParams
+                    params.width = minOf(dp(560f), resources.displayMetrics.widthPixels - dp(32f))
+                    if (params is androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams) {
+                        params.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                    }
+                    sheet.layoutParams = params
+                }
+            }
+        }
+        dialog.show()
+        applyResponsiveRuleSheetWidth(dialog, expand = true)
     }
 
     private fun showThreadWildcardSuggestion(
         suggestion: ThreadWildcardSuggestion,
+        onClose: (() -> Unit)? = null,
         onSelect: (String) -> Unit
     ) {
         val view = DialogThreadWildcardBinding.inflate(layoutInflater)
@@ -3944,13 +5658,16 @@ class MainActivity : AppCompatActivity() {
         }
 
         fun finish(name: String) {
-            onSelect(name)
             dialog.dismiss()
+            mainHandler.post { onSelect(name) }
         }
 
         view.wildcardKeepExact.setOnClickListener { finish(suggestion.exactName) }
         view.wildcardUsePattern.setOnClickListener { finish(suggestion.pattern) }
-        view.wildcardClose.setOnClickListener { dialog.dismiss() }
+        view.wildcardClose.setOnClickListener {
+            dialog.dismiss()
+            onClose?.let { callback -> mainHandler.post(callback) }
+        }
         dialog.setCancelable(false)
         dialog.setCanceledOnTouchOutside(false)
         dialog.setContentView(view.root)
@@ -3961,10 +5678,13 @@ class MainActivity : AppCompatActivity() {
             dialog.behavior.isHideable = false
         }
         dialog.show()
+        applyResponsiveRuleSheetWidth(dialog, expand = true)
     }
 
     private inner class RuleHistoryAdapter(
         private val baseOwner: String,
+        private val multiSelect: Boolean,
+        private val selected: MutableSet<String>,
         private val onSelect: (RuleHistoryCandidate) -> Unit
     ) : RecyclerView.Adapter<RuleHistoryAdapter.Holder>() {
         private var items: List<RuleHistoryCandidate> = emptyList()
@@ -3982,6 +5702,30 @@ class MainActivity : AppCompatActivity() {
 
         override fun onBindViewHolder(holder: Holder, position: Int) {
             val candidate = items[position]
+            val key = "${candidate.kind}|${candidate.owner}|${candidate.thread.orEmpty()}"
+            holder.binding.root.setCardBackgroundColor(
+                ContextCompat.getColor(this@MainActivity, R.color.card_bg)
+            )
+            holder.binding.root.backgroundTintList = ColorStateList.valueOf(Color.WHITE)
+            holder.binding.root.setCardForegroundColor(
+                ColorStateList.valueOf(Color.TRANSPARENT)
+            )
+            holder.binding.candidateCheck.visibility = if (multiSelect) View.VISIBLE else View.GONE
+            holder.binding.candidateCheck.setOnCheckedChangeListener(null)
+            holder.binding.candidateCheck.isChecked = key in selected
+            lateinit var checkListener: CompoundButton.OnCheckedChangeListener
+            checkListener = CompoundButton.OnCheckedChangeListener { button, checked ->
+                if (checked && key !in selected && selected.size >= MAX_RULE_HISTORY_SELECTION) {
+                    button.setOnCheckedChangeListener(null)
+                    button.isChecked = false
+                    button.setOnCheckedChangeListener(checkListener)
+                    toast("一次最多选择 $MAX_RULE_HISTORY_SELECTION 个线程")
+                    return@OnCheckedChangeListener
+                }
+                if (checked) selected.add(key) else selected.remove(key)
+                onSelect(candidate)
+            }
+            holder.binding.candidateCheck.setOnCheckedChangeListener(checkListener)
             holder.binding.candidateName.text = historyCandidateName(baseOwner, candidate)
             val scopeLabel = when {
                 candidate.kind == RuleHistoryKind.CHILD_PROCESS -> "子进程"
@@ -4015,7 +5759,13 @@ class MainActivity : AppCompatActivity() {
             holder.binding.candidateMax.text = candidate.max?.let {
                 String.format(Locale.US, "MAX %.1f%%", it)
             } ?: "MAX --"
-            holder.binding.root.setOnClickListener { onSelect(candidate) }
+            holder.binding.root.setOnClickListener {
+                if (multiSelect) {
+                    holder.binding.candidateCheck.isChecked = !holder.binding.candidateCheck.isChecked
+                } else {
+                    onSelect(candidate)
+                }
+            }
         }
 
         override fun getItemCount(): Int = items.size

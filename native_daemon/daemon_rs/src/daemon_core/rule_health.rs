@@ -6,10 +6,11 @@
 //
 // 负向观察窗口只跟随 ActivityTaskManager helper 写入的可靠前台状态。helper
 // 不可用时仍接受真实命中，但不累计 miss，避免后台存活的主进程造成误报。
-// 规则身份只包含 owner + 线程/子进程名，不包含 CPU 范围，因此只修改核心范围会保留
-// 既有状态，修改线程名/子进程名才会创建新的 Pending 状态并重新观察。
+// 规则身份只包含 owner + 线程/子进程名。CPU 范围变化会更新展示行；已确认规则
+// 保持有效，曾停用或正在复查的规则则重新进入 Pending。
 #[derive(Debug, Default)]
 struct RuleHealthForegroundState {
+    interactive: Option<bool>,
     reliable: bool,
     observable: bool,
     selection: String,
@@ -120,6 +121,144 @@ fn ensure_rule_health_loaded(state: &mut DaemonState) -> io::Result<()> {
     Ok(())
 }
 
+fn consume_rule_health_reset_request(state: &mut DaemonState) -> io::Result<BTreeSet<String>> {
+    ensure_rule_health_loaded(state)?;
+    let request = Path::new(RULE_HEALTH_RESET_FILE);
+    let claim = Path::new(RULE_HEALTH_RESET_CLAIM_FILE);
+
+    let claimed = match fs::metadata(claim) {
+        Ok(metadata) if metadata.is_file() => true,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "规则健康重新检测认领路径不是普通文件",
+            ));
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => match fs::rename(request, claim) {
+            Ok(()) => true,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+            Err(err) => return Err(err),
+        },
+        Err(err) => return Err(err),
+    };
+    if !claimed {
+        return Ok(BTreeSet::new());
+    }
+
+    let content = fs::read_to_string(claim)?;
+    let requested = content
+        .lines()
+        .filter_map(normalize_rule_health_reset_package)
+        .collect::<BTreeSet<_>>();
+    let (reset_count, reset_packages) = reset_rule_health_packages(state, &requested);
+    // 状态文件写盘成功后才能删除认领文件。进程在两步之间退出时，下次启动会
+    // 重新消费 processing 文件；重复处理是幂等的，不会丢失用户请求。
+    finish_rule_health_update(false, state)?;
+    fs::remove_file(claim)?;
+    if reset_count > 0 {
+        println!(
+            "[RS] 规则健康已重新检测: 应用={} 规则={} [{}]",
+            reset_packages.len(),
+            reset_count,
+            reset_packages.iter().cloned().collect::<Vec<_>>().join(",")
+        );
+    }
+    Ok(reset_packages)
+}
+
+fn normalize_rule_health_reset_package(raw: &str) -> Option<String> {
+    let pkg = raw.trim().trim_start_matches('\u{feff}');
+    if pkg.is_empty()
+        || pkg.starts_with('#')
+        || pkg.len() > MAX_CONFIG_OWNER_BYTES
+        || pkg.contains(':')
+        || pkg.starts_with('.')
+        || pkg.ends_with('.')
+        || pkg.split('.').any(str::is_empty)
+        || !pkg
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
+    {
+        return None;
+    }
+    Some(pkg.to_string())
+}
+
+fn reset_rule_health_packages(
+    state: &mut DaemonState,
+    requested: &BTreeSet<String>,
+) -> (usize, BTreeSet<String>) {
+    if requested.is_empty() {
+        return (0, BTreeSet::new());
+    }
+    let mut reset_count = 0usize;
+    let mut reset_packages = BTreeSet::new();
+    for entry in state.rule_health.values_mut() {
+        let Some(pkg) = base_package(&entry.owner).map(str::to_owned) else {
+            continue;
+        };
+        if !requested.contains(&pkg)
+            || (entry.status == RuleHealthStatus::Valid
+                || (entry.status == RuleHealthStatus::Pending && entry.miss_count == 0))
+        {
+            continue;
+        }
+        reset_rule_health_entry(entry);
+        reset_count = reset_count.saturating_add(1);
+        reset_packages.insert(pkg);
+    }
+    if reset_count == 0 {
+        return (0, reset_packages);
+    }
+    clear_rule_health_observation_state(state, &reset_packages);
+    state.rule_health_dirty = true;
+    state.runtime_rule_index_dirty = true;
+    (reset_count, reset_packages)
+}
+
+fn reset_rule_health_entry(entry: &mut RuleHealthEntry) {
+    entry.status = RuleHealthStatus::Pending;
+    entry.miss_count = 0;
+    entry.first_observed_at = 0;
+    entry.last_matched_at = 0;
+    entry.last_checked_at = 0;
+    entry.last_checked_boot_id.clear();
+    entry.last_checked_lifecycle_elapsed_ms = 0;
+}
+
+fn clear_rule_health_observation_state(
+    state: &mut DaemonState,
+    packages: &BTreeSet<String>,
+) {
+    state
+        .health_active_packages
+        .retain(|pkg| !packages.contains(pkg));
+    state
+        .health_session_started
+        .retain(|pkg, _| !packages.contains(pkg));
+    state
+        .health_session_checked
+        .retain(|pkg| !packages.contains(pkg));
+    state
+        .health_session_full_scan_at
+        .retain(|pkg, _| !packages.contains(pkg));
+    state
+        .health_session_full_scan_attempted
+        .retain(|pkg| !packages.contains(pkg));
+    state
+        .health_session_lifecycle
+        .retain(|pkg, _| !packages.contains(pkg));
+    state
+        .health_session_observed_owners
+        .retain(|pkg, _| !packages.contains(pkg));
+    state
+        .health_session_eligible_keys
+        .retain(|pkg, _| !packages.contains(pkg));
+    state
+        .foreground_scan_lifecycles
+        .retain(|pkg, _| !packages.contains(pkg));
+}
+
 fn disabled_rule_health_lines(rules: &[Rule], state: &DaemonState) -> Vec<String> {
     rules
         .iter()
@@ -146,12 +285,104 @@ fn update_rule_health(
     hits: &[ProcHit],
     full_scan_evidence: Option<&FullScanEvidence>,
     scope_pkg: Option<&str>,
+    definitions_changed: bool,
+    foreground: &RuleHealthForegroundState,
+    now_elapsed: u64,
     state: &mut DaemonState,
 ) -> io::Result<()> {
     ensure_rule_health_loaded(state)?;
 
     let now_wall = unix_now_secs();
-    let now_elapsed = elapsed_realtime_ms();
+    let (mut changed, new_keys) = if definitions_changed {
+        sync_rule_health_definitions(rules, scope_pkg, state)
+    } else {
+        (false, HashSet::new())
+    };
+
+    // 真实命中不要求位于观察窗口内。missed 仍保留只读匹配索引，因此目标以后
+    // 重新出现时可以自动恢复；恢复后的下一轮才重新生成 affinity 动作。
+    let matched_keys = collect_matched_rule_health_keys(hits);
+    for key in matched_keys {
+        let Some(entry) = state.rule_health.get_mut(&key) else {
+            continue;
+        };
+        if !rule_health_entry_in_scope(entry, scope_pkg) || entry.status == RuleHealthStatus::Valid {
+            continue;
+        }
+        if entry.status == RuleHealthStatus::Missed {
+            println!("[RS] 规则健康已恢复: {}", entry.rule_line);
+        } else {
+            println!("[RS] 规则健康已确认: {}", entry.rule_line);
+        }
+        entry.status = RuleHealthStatus::Valid;
+        entry.miss_count = 0;
+        entry.last_matched_at = now_wall;
+        entry.last_checked_at = now_wall;
+        changed = true;
+    }
+
+    if !state.rule_health.values().any(|entry| {
+        rule_health_entry_in_scope(entry, scope_pkg)
+            && rule_health_status_is_observable(entry.status)
+    }) {
+        state.health_active_packages.clear();
+        state.health_session_started.clear();
+        state.health_session_checked.clear();
+        state.health_session_full_scan_at.clear();
+        state.health_session_full_scan_attempted.clear();
+        state.health_session_lifecycle.clear();
+        state.health_session_observed_owners.clear();
+        state.health_session_eligible_keys.clear();
+        return finish_rule_health_update(changed, state);
+    }
+
+    let pending_packages = state
+        .rule_health
+        .values()
+        .filter(|entry| {
+            rule_health_entry_in_scope(entry, scope_pkg)
+                && rule_health_status_is_observable(entry.status)
+        })
+        .filter_map(|entry| base_package(&entry.owner).map(str::to_string))
+        .collect::<BTreeSet<_>>();
+
+    // 全部规则都已 valid/missed 时停止维护观察会话。
+    if pending_packages.is_empty() {
+        state.health_active_packages.clear();
+        state.health_session_started.clear();
+        state.health_session_checked.clear();
+        state.health_session_full_scan_at.clear();
+        state.health_session_full_scan_attempted.clear();
+        state.health_session_lifecycle.clear();
+        state.health_session_observed_owners.clear();
+        state.health_session_eligible_keys.clear();
+        return finish_rule_health_update(changed, state);
+    }
+
+    let current_boot_id = rule_health_current_boot_id(now_elapsed)
+        .unwrap_or_default()
+        .to_string();
+
+    update_rule_health_observation(
+        &pending_packages,
+        &new_keys,
+        full_scan_evidence,
+        foreground,
+        &current_boot_id,
+        now_wall,
+        now_elapsed,
+        state,
+        &mut changed,
+    );
+
+    finish_rule_health_update(changed, state)
+}
+
+fn sync_rule_health_definitions(
+    rules: &[Rule],
+    scope_pkg: Option<&str>,
+    state: &mut DaemonState,
+) -> (bool, HashSet<String>) {
     let mut active_rules = HashMap::<String, RuleHealthEntry>::new();
     for rule in rules
         .iter()
@@ -182,9 +413,7 @@ fn update_rule_health(
     for (key, fresh) in active_rules {
         match state.rule_health.get_mut(&key) {
             Some(existing) => {
-                // CPU 范围变化只更新展示行，不改变状态或重新计时。
-                if existing.rule_line != fresh.rule_line {
-                    existing.rule_line = fresh.rule_line;
+                if refresh_rule_health_entry(existing, &fresh) {
                     changed = true;
                 }
             }
@@ -195,66 +424,21 @@ fn update_rule_health(
         }
     }
 
-    if !state.rule_health.values().any(|entry| {
-        rule_health_entry_in_scope(entry, scope_pkg)
-            && rule_health_status_is_observable(entry.status)
-    }) {
-        state.health_active_packages.clear();
-        state.health_session_started.clear();
-        state.health_session_checked.clear();
-        state.health_session_full_scan_at.clear();
-        state.health_session_full_scan_attempted.clear();
-        state.health_session_lifecycle.clear();
-        state.health_session_eligible_keys.clear();
-        return finish_rule_health_update(changed, state);
-    }
+    (changed, new_keys)
+}
 
-    // 真实命中不要求必须位于观察窗口内，但只确认仍处于 pending 的规则。连续两次
-    // 未命中进入 missed 后即为终态，后续启动不再重复观察或自动恢复。
-    let matched_keys = collect_matched_rule_health_keys(hits);
-    for key in matched_keys {
-        let Some(entry) = state.rule_health.get_mut(&key) else {
-            continue;
-        };
-        if !rule_health_entry_in_scope(entry, scope_pkg)
-            || !rule_health_status_is_observable(entry.status)
-        {
-            continue;
-        }
-        println!("[RS] 规则健康已确认: {}", entry.rule_line);
-        entry.status = RuleHealthStatus::Valid;
-        entry.miss_count = 0;
-        entry.last_matched_at = now_wall;
-        entry.last_checked_at = now_wall;
-        changed = true;
-    }
-
-    let pending_packages = state
-        .rule_health
-        .values()
-        .filter(|entry| {
-            rule_health_entry_in_scope(entry, scope_pkg)
-                && rule_health_status_is_observable(entry.status)
-        })
-        .filter_map(|entry| base_package(&entry.owner).map(str::to_string))
-        .collect::<BTreeSet<_>>();
-
-    // 全部规则都已 valid/missed 时停止读取前台状态文件，也清掉仅用于观察的会话内存。
-    if pending_packages.is_empty() {
-        state.health_active_packages.clear();
-        state.health_session_started.clear();
-        state.health_session_checked.clear();
-        state.health_session_full_scan_at.clear();
-        state.health_session_full_scan_attempted.clear();
-        state.health_session_lifecycle.clear();
-        state.health_session_eligible_keys.clear();
-        return finish_rule_health_update(changed, state);
-    }
-
-    let foreground = read_rule_health_foreground_state(now_elapsed);
-    let current_boot_id = rule_health_current_boot_id(now_elapsed)
-        .unwrap_or_default()
-        .to_string();
+#[allow(clippy::too_many_arguments)]
+fn update_rule_health_observation(
+    pending_packages: &BTreeSet<String>,
+    new_keys: &HashSet<String>,
+    full_scan_evidence: Option<&FullScanEvidence>,
+    foreground: &RuleHealthForegroundState,
+    current_boot_id: &str,
+    now_wall: u64,
+    now_elapsed: u64,
+    state: &mut DaemonState,
+    changed: &mut bool,
+) {
 
     // 旧版 9 列状态没有单调时钟生命周期身份。首次遇到仍被旧墙上时间判定为
     // 已检查的生命周期时完成迁移，避免系统时间回拨后永久跳过后续启动。
@@ -271,9 +455,9 @@ fn update_rule_health(
                 && entry.last_checked_at.saturating_mul(1000) >= lifecycle.entered_wall_ms
         }) {
             if !current_boot_id.is_empty() {
-                entry.last_checked_boot_id = current_boot_id.clone();
+                entry.last_checked_boot_id = current_boot_id.to_string();
                 entry.last_checked_lifecycle_elapsed_ms = lifecycle.entered_elapsed_ms;
-                changed = true;
+                *changed = true;
             }
         }
     }
@@ -304,6 +488,15 @@ fn update_rule_health(
                     .health_session_full_scan_at
                     .entry(pkg.clone())
                     .or_insert(scanned_at);
+                state.health_session_observed_owners.insert(
+                    pkg.clone(),
+                    evidence
+                        .observed_owners
+                        .iter()
+                        .filter(|owner| base_package(owner) == Some(pkg.as_str()))
+                        .cloned()
+                        .collect(),
+                );
                 state.health_session_full_scan_attempted.remove(pkg);
             } else if state.health_session_full_scan_attempted.insert(pkg.clone()) {
                 println!(
@@ -325,6 +518,7 @@ fn update_rule_health(
             if started.is_some() && !state.health_session_checked.contains(&pkg) {
                 state.health_session_checked.insert(pkg.clone());
                 state.health_session_full_scan_at.remove(&pkg);
+                state.health_session_observed_owners.remove(&pkg);
                 state.health_session_eligible_keys.remove(&pkg);
                 println!(
                     "[RS] 规则健康观察取消: 应用={} 原因=前台 helper 暂不可用，本次启动不累计未命中",
@@ -354,6 +548,7 @@ fn update_rule_health(
         state.health_session_full_scan_at.remove(&pkg);
         state.health_session_full_scan_attempted.remove(&pkg);
         state.health_session_lifecycle.remove(&pkg);
+        state.health_session_observed_owners.remove(&pkg);
         if started.is_some() && !checked {
             let reason = if exited.is_some() {
                 "前台生命周期中断"
@@ -368,7 +563,7 @@ fn update_rule_health(
 
     // 进入会话时只接受 helper 的 focused_package；visible_packages 只用于分屏/浮窗场景
     // 维持已开始的会话。helper 不可用时不产生负向观察结果。
-    for pkg in &pending_packages {
+    for pkg in pending_packages {
         let Some(lifecycle) = foreground.lifecycle(pkg) else {
             continue;
         };
@@ -383,7 +578,7 @@ fn update_rule_health(
                 && !rule_health_entry_checked_in_lifecycle(
                     entry,
                     lifecycle,
-                    &current_boot_id,
+                    current_boot_id,
                 )
                 })
             })
@@ -395,12 +590,12 @@ fn update_rule_health(
             let eligible = pending_rule_health_keys_for_package(
                 pkg,
                 lifecycle,
-                &current_boot_id,
+                current_boot_id,
                 state,
             );
             if start_rule_health_observation(pkg, lifecycle, eligible, now_wall, now_elapsed, state)
             {
-                changed = true;
+                *changed = true;
             }
         } else if state.health_active_packages.contains(pkg) && !new_pkg_keys.is_empty() && in_scope
         {
@@ -414,7 +609,7 @@ fn update_rule_health(
             eligible.extend(new_pkg_keys);
             if start_rule_health_observation(pkg, lifecycle, eligible, now_wall, now_elapsed, state)
             {
-                changed = true;
+                *changed = true;
             }
         }
     }
@@ -445,13 +640,18 @@ fn update_rule_health(
             .health_session_eligible_keys
             .remove(&pkg)
             .unwrap_or_default();
+        let observed_owners = state
+            .health_session_observed_owners
+            .remove(&pkg)
+            .unwrap_or_default();
         let lifecycle = state.health_session_lifecycle.get(&pkg).copied();
         let (first_miss, confirmed_miss) = finish_rule_health_observation(
             &pkg,
             &eligible,
+            &observed_owners,
             now_wall,
             lifecycle,
-            &current_boot_id,
+            current_boot_id,
             state,
         );
         // 保留本次前台生命周期的 started。即使已经完成一次观察，helper 后续记录的
@@ -460,15 +660,28 @@ fn update_rule_health(
         state.health_session_full_scan_attempted.remove(&pkg);
         state.health_session_checked.insert(pkg.clone());
         if first_miss + confirmed_miss > 0 {
-            changed = true;
+            *changed = true;
             println!(
                 "[RS] 规则健康观察结束: 应用={} 首次待复核={} 连续未命中={}，会话保持到应用离开",
                 pkg, first_miss, confirmed_miss
             );
         }
     }
+}
 
-    finish_rule_health_update(changed, state)
+fn refresh_rule_health_entry(existing: &mut RuleHealthEntry, fresh: &RuleHealthEntry) -> bool {
+    if existing.rule_line == fresh.rule_line {
+        return false;
+    }
+    // key 相同而规则行变化只可能是 CPU 范围变化。旧 missed 不能继续继承，
+    // 否则用户修改核心范围后规则仍会被运行时索引过滤。
+    existing.rule_line = fresh.rule_line.clone();
+    if existing.status == RuleHealthStatus::Missed
+        || (existing.status == RuleHealthStatus::Pending && existing.miss_count > 0)
+    {
+        reset_rule_health_entry(existing);
+    }
+    true
 }
 
 fn rule_health_scan_due_packages(state: &DaemonState) -> BTreeSet<String> {
@@ -518,6 +731,7 @@ fn rule_health_observation_complete(started_elapsed: u64, ended_elapsed: u64) ->
 fn finish_rule_health_observation(
     pkg: &str,
     eligible_keys: &BTreeSet<String>,
+    observed_owners: &BTreeSet<String>,
     now_wall: u64,
     lifecycle: Option<RuleHealthLifecycle>,
     current_boot_id: &str,
@@ -525,6 +739,24 @@ fn finish_rule_health_observation(
 ) -> (usize, usize) {
     let mut first_miss = 0usize;
     let mut confirmed_miss = 0usize;
+    let deferred_child_threads = state
+        .rule_health
+        .iter()
+        .filter(|(key, entry)| {
+            eligible_keys.contains(*key)
+                && base_package(&entry.owner) == Some(pkg)
+                && rule_health_status_is_observable(entry.status)
+                && entry.kind == 'T'
+                && entry.owner.contains(':')
+                && !observed_owners.contains(&entry.owner)
+        })
+        .count();
+    if deferred_child_threads > 0 {
+        println!(
+            "[RS] 规则健康观察保留: 应用={} 子进程未出现，延后检查子线程规则={}条",
+            pkg, deferred_child_threads
+        );
+    }
     for entry in state
         .rule_health
         .iter_mut()
@@ -532,6 +764,9 @@ fn finish_rule_health_observation(
             eligible_keys.contains(*key)
                 && base_package(&entry.owner) == Some(pkg)
                 && rule_health_status_is_observable(entry.status)
+                && (entry.kind != 'T'
+                    || !entry.owner.contains(':')
+                    || observed_owners.contains(&entry.owner))
         })
         .map(|(_, entry)| entry)
     {
@@ -560,6 +795,8 @@ fn foreground_discovery_scan_due(
     scope_pkg: Option<&str>,
     configured_packages: &BTreeSet<String>,
     state: &mut DaemonState,
+    foreground: &RuleHealthForegroundState,
+    now_elapsed: u64,
 ) -> Option<String> {
     state.foreground_scan_lifecycles.retain(|pkg, _| {
         scope_pkg.is_none_or(|scope| scope == pkg)
@@ -568,8 +805,6 @@ fn foreground_discovery_scan_due(
     if configured_packages.is_empty() {
         return None;
     }
-    let now_elapsed = elapsed_realtime_ms();
-    let foreground = read_rule_health_foreground_state(now_elapsed);
     let pkg = foreground.focused_package.as_str();
     if pkg.is_empty()
         || !foreground.can_start(pkg)
@@ -634,6 +869,7 @@ fn start_rule_health_observation(
         .insert(pkg.to_string(), lifecycle);
     state.health_session_full_scan_at.remove(pkg);
     state.health_session_full_scan_attempted.remove(pkg);
+    state.health_session_observed_owners.remove(pkg);
     if eligible_keys.is_empty() {
         state.health_session_checked.insert(pkg.to_string());
         state.health_session_eligible_keys.remove(pkg);
@@ -685,6 +921,7 @@ fn read_rule_health_foreground_state(now_elapsed: u64) -> RuleHealthForegroundSt
     let mut lifecycle_packages = HashMap::new();
     let mut exited_packages = HashMap::new();
     let mut updated_elapsed_ms = 0u64;
+    let mut interactive = None;
 
     for line in raw.lines() {
         let Some((key, value)) = line.split_once('=') else {
@@ -749,6 +986,13 @@ fn read_rule_health_foreground_state(now_elapsed: u64) -> RuleHealthForegroundSt
                 }
             }
             "updated_elapsed_ms" => updated_elapsed_ms = value.trim().parse().unwrap_or(0),
+            "interactive" => {
+                interactive = match value.trim() {
+                    "1" => Some(true),
+                    "0" => Some(false),
+                    _ => None,
+                };
+            }
             _ => {}
         }
     }
@@ -757,13 +1001,15 @@ fn read_rule_health_foreground_state(now_elapsed: u64) -> RuleHealthForegroundSt
         && now_elapsed >= updated_elapsed_ms
         && now_elapsed.saturating_sub(updated_elapsed_ms) <= FOREGROUND_TASK_MAX_AGE_MS;
     let boot_matches = rule_health_current_boot_id(now_elapsed) == Some(boot_id.as_str());
-    let reliable = version >= 2
-        && boot_matches
-        && fresh
+    let identity_reliable = version >= 2 && boot_matches && fresh;
+    let reliable = identity_reliable
         && mode == "listener"
         && matches!(status.as_str(), "ok" | "empty");
     if !reliable {
-        return RuleHealthForegroundState::default();
+        return RuleHealthForegroundState {
+            interactive: identity_reliable.then_some(interactive).flatten(),
+            ..RuleHealthForegroundState::default()
+        };
     }
     lifecycle_packages.retain(|_, lifecycle| {
         lifecycle.entered_elapsed_ms <= updated_elapsed_ms
@@ -776,6 +1022,7 @@ fn read_rule_health_foreground_state(now_elapsed: u64) -> RuleHealthForegroundSt
             "focused" | "default-visible" | "visible"
         );
     RuleHealthForegroundState {
+        interactive,
         reliable: true,
         observable,
         selection,
@@ -785,40 +1032,6 @@ fn read_rule_health_foreground_state(now_elapsed: u64) -> RuleHealthForegroundSt
         exited_packages,
         updated_elapsed_ms,
     }
-}
-
-fn read_foreground_interactive(now_elapsed: u64) -> Option<bool> {
-    let raw = fs::read_to_string(FOREGROUND_TASK_STATE_FILE).ok()?;
-    let mut version = 0u32;
-    let mut boot_id = String::new();
-    let mut updated_elapsed_ms = 0u64;
-    let mut interactive = None;
-    for line in raw.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        match key.trim() {
-            "version" => version = value.trim().parse().unwrap_or(0),
-            "boot_id" => boot_id = value.trim().to_string(),
-            "updated_elapsed_ms" => updated_elapsed_ms = value.trim().parse().unwrap_or(0),
-            "interactive" => {
-                interactive = match value.trim() {
-                    "1" => Some(true),
-                    "0" => Some(false),
-                    _ => None,
-                };
-            }
-            _ => {}
-        }
-    }
-    let fresh = updated_elapsed_ms > 0
-        && now_elapsed >= updated_elapsed_ms
-        && now_elapsed.saturating_sub(updated_elapsed_ms) <= FOREGROUND_TASK_MAX_AGE_MS;
-    (version >= 2
-        && fresh
-        && rule_health_current_boot_id(now_elapsed) == Some(boot_id.as_str()))
-    .then_some(interactive)
-    .flatten()
 }
 
 fn rule_health_current_boot_id(now_elapsed: u64) -> Option<&'static str> {
@@ -873,6 +1086,7 @@ fn collect_matched_rule_health_keys(hits: &[ProcHit]) -> HashSet<String> {
         if hit.cmdline.contains(':') {
             keys.insert(rule_health_key('P', &hit.cmdline, ""));
         }
+        keys.extend(hit.matched_rule_health_keys.iter().cloned());
         for action in hit
             .actions
             .iter()
@@ -1061,4 +1275,234 @@ fn unescape_rule_health_field(value: &str) -> String {
         }
     }
     output
+}
+
+#[cfg(test)]
+mod rule_health_state_tests {
+    use super::*;
+
+    fn pending_health_entry(owner: &str, thread: Option<&str>) -> RuleHealthEntry {
+        let rule = Rule {
+            owner: owner.to_string(),
+            thread: thread.map(str::to_string),
+            cpus: "4-7".to_string(),
+            auto: false,
+        };
+        rule_health_entry_from_rule(&rule).unwrap()
+    }
+
+    #[test]
+    fn child_thread_miss_waits_until_its_process_owner_is_observed() {
+        let main = pending_health_entry("com.example", Some("RenderThread"));
+        let child_process = pending_health_entry("com.example:worker", None);
+        let child_thread = pending_health_entry("com.example:worker", Some("Worker-*"));
+        let main_key = rule_health_entry_key(&main);
+        let child_process_key = rule_health_entry_key(&child_process);
+        let child_thread_key = rule_health_entry_key(&child_thread);
+        let eligible = BTreeSet::from([
+            main_key.clone(),
+            child_process_key.clone(),
+            child_thread_key.clone(),
+        ]);
+        let mut state = DaemonState::default();
+        state.rule_health.insert(main_key.clone(), main);
+        state
+            .rule_health
+            .insert(child_process_key.clone(), child_process);
+        state
+            .rule_health
+            .insert(child_thread_key.clone(), child_thread);
+
+        let result = finish_rule_health_observation(
+            "com.example",
+            &eligible,
+            &BTreeSet::new(),
+            100,
+            None,
+            "",
+            &mut state,
+        );
+
+        assert_eq!(result, (2, 0));
+        assert_eq!(state.rule_health[&main_key].miss_count, 1);
+        assert_eq!(state.rule_health[&child_process_key].miss_count, 1);
+        assert_eq!(state.rule_health[&child_thread_key].miss_count, 0);
+        assert_eq!(
+            state.rule_health[&child_thread_key].status,
+            RuleHealthStatus::Pending
+        );
+    }
+
+    #[test]
+    fn observed_child_process_allows_its_missing_thread_to_be_checked() {
+        let child_thread = pending_health_entry("com.example:worker", Some("Worker-*"));
+        let child_thread_key = rule_health_entry_key(&child_thread);
+        let mut state = DaemonState::default();
+        state
+            .rule_health
+            .insert(child_thread_key.clone(), child_thread);
+
+        let result = finish_rule_health_observation(
+            "com.example",
+            &BTreeSet::from([child_thread_key.clone()]),
+            &BTreeSet::from(["com.example:worker".to_string()]),
+            100,
+            None,
+            "",
+            &mut state,
+        );
+
+        assert_eq!(result, (1, 0));
+        assert_eq!(state.rule_health[&child_thread_key].miss_count, 1);
+    }
+
+    #[test]
+    fn cpu_range_change_reactivates_a_missed_rule() {
+        let old_rule = Rule {
+            owner: "com.example".to_string(),
+            thread: Some("RenderThread".to_string()),
+            cpus: "4-5".to_string(),
+            auto: false,
+        };
+        let new_rule = Rule {
+            cpus: "4-7".to_string(),
+            ..old_rule.clone()
+        };
+        let mut existing = rule_health_entry_from_rule(&old_rule).unwrap();
+        existing.status = RuleHealthStatus::Missed;
+        existing.miss_count = 2;
+        existing.last_checked_at = 123;
+        let fresh = rule_health_entry_from_rule(&new_rule).unwrap();
+
+        assert!(refresh_rule_health_entry(&mut existing, &fresh));
+        assert_eq!(existing.status, RuleHealthStatus::Pending);
+        assert_eq!(existing.miss_count, 0);
+        assert_eq!(existing.last_checked_at, 0);
+        assert_eq!(existing.rule_line, "com.example{RenderThread}=4-7");
+    }
+
+    #[test]
+    fn cpu_range_change_keeps_a_valid_rule_valid() {
+        let old_rule = Rule {
+            owner: "com.example".to_string(),
+            thread: Some("RenderThread".to_string()),
+            cpus: "4-5".to_string(),
+            auto: false,
+        };
+        let new_rule = Rule {
+            cpus: "4-7".to_string(),
+            ..old_rule.clone()
+        };
+        let mut existing = rule_health_entry_from_rule(&old_rule).unwrap();
+        existing.status = RuleHealthStatus::Valid;
+        existing.last_matched_at = 123;
+        existing.last_checked_at = 456;
+        let fresh = rule_health_entry_from_rule(&new_rule).unwrap();
+
+        assert!(refresh_rule_health_entry(&mut existing, &fresh));
+        assert_eq!(existing.status, RuleHealthStatus::Valid);
+        assert_eq!(existing.last_matched_at, 123);
+        assert_eq!(existing.last_checked_at, 456);
+        assert_eq!(existing.rule_line, "com.example{RenderThread}=4-7");
+    }
+
+    #[test]
+    fn unchanged_definitions_do_not_rebuild_rule_health_entries() {
+        let rules = vec![Rule {
+            owner: "com.example".to_string(),
+            thread: Some("RenderThread".to_string()),
+            cpus: "4-7".to_string(),
+            auto: false,
+        }];
+        let mut state = DaemonState::default();
+
+        let (first_changed, first_new) =
+            sync_rule_health_definitions(&rules, None, &mut state);
+        assert!(first_changed);
+        assert_eq!(first_new.len(), 1);
+
+        let key = first_new.iter().next().unwrap().clone();
+        let entry = state.rule_health.get_mut(&key).unwrap();
+        entry.status = RuleHealthStatus::Valid;
+        entry.last_matched_at = 123;
+
+        let (second_changed, second_new) =
+            sync_rule_health_definitions(&rules, None, &mut state);
+        assert!(!second_changed);
+        assert!(second_new.is_empty());
+        let entry = state.rule_health.get(&key).unwrap();
+        assert_eq!(entry.status, RuleHealthStatus::Valid);
+        assert_eq!(entry.last_matched_at, 123);
+    }
+
+    #[test]
+    fn reset_request_only_reactivates_requested_missed_rules() {
+        let make_entry = |owner: &str, status: RuleHealthStatus, miss_count: u32| {
+            let rule = Rule {
+                owner: owner.to_string(),
+                thread: Some("RenderThread".to_string()),
+                cpus: "4-7".to_string(),
+                auto: false,
+            };
+            let mut entry = rule_health_entry_from_rule(&rule).unwrap();
+            entry.status = status;
+            entry.miss_count = miss_count;
+            entry.first_observed_at = 11;
+            entry.last_matched_at = 12;
+            entry.last_checked_at = 22;
+            entry.last_checked_boot_id = "boot".to_string();
+            entry.last_checked_lifecycle_elapsed_ms = 33;
+            entry
+        };
+        let requested_entry = make_entry("com.requested", RuleHealthStatus::Missed, 2);
+        let pending_entry = make_entry("com.requested:pending", RuleHealthStatus::Pending, 1);
+        let other_entry = make_entry("com.other", RuleHealthStatus::Missed, 2);
+        let valid_entry = make_entry("com.requested:worker", RuleHealthStatus::Valid, 0);
+        let requested_key = rule_health_entry_key(&requested_entry);
+        let pending_key = rule_health_entry_key(&pending_entry);
+        let other_key = rule_health_entry_key(&other_entry);
+        let valid_key = rule_health_entry_key(&valid_entry);
+        let mut state = DaemonState::default();
+        state
+            .rule_health
+            .insert(requested_key.clone(), requested_entry);
+        state.rule_health.insert(pending_key.clone(), pending_entry);
+        state.rule_health.insert(other_key.clone(), other_entry);
+        state.rule_health.insert(valid_key.clone(), valid_entry);
+        state
+            .health_session_started
+            .insert("com.requested".to_string(), 100);
+        state.health_session_checked.insert("com.requested".to_string());
+
+        let requested = BTreeSet::from(["com.requested".to_string()]);
+        let (count, packages) = reset_rule_health_packages(&mut state, &requested);
+
+        assert_eq!(count, 2);
+        assert_eq!(packages, requested);
+        let reset = state.rule_health.get(&requested_key).unwrap();
+        assert_eq!(reset.status, RuleHealthStatus::Pending);
+        assert_eq!(reset.miss_count, 0);
+        assert_eq!(reset.first_observed_at, 0);
+        assert_eq!(reset.last_matched_at, 0);
+        assert_eq!(reset.last_checked_at, 0);
+        assert!(reset.last_checked_boot_id.is_empty());
+        assert_eq!(reset.last_checked_lifecycle_elapsed_ms, 0);
+        assert_eq!(
+            state.rule_health.get(&pending_key).unwrap().status,
+            RuleHealthStatus::Pending
+        );
+        assert_eq!(state.rule_health.get(&pending_key).unwrap().miss_count, 0);
+        assert_eq!(
+            state.rule_health.get(&other_key).unwrap().status,
+            RuleHealthStatus::Missed
+        );
+        assert_eq!(
+            state.rule_health.get(&valid_key).unwrap().status,
+            RuleHealthStatus::Valid
+        );
+        assert!(!state.health_session_started.contains_key("com.requested"));
+        assert!(!state.health_session_checked.contains("com.requested"));
+        assert!(state.rule_health_dirty);
+        assert!(state.runtime_rule_index_dirty);
+    }
 }

@@ -32,25 +32,19 @@ internal object RuleConfigLogic {
     }
 
     fun parseCpuBounds(value: String): CpuBounds? {
-        val cpus = parseCpuRangeList(value) ?: return null
+        val cpus = parseNativeCpuRangeList(value) ?: return null
         if (cpus.isEmpty()) return null
         return CpuBounds(cpus.min(), cpus.max())
     }
 
+    /**
+     * 读取现有规则时采用守护进程语义。旧配置中的 3-3、前导零和重叠区间都
+     * 是有效掩码；编辑器保存时再由 [formatCpuRangeList] 输出规范格式。
+     */
     fun parseCpuRangeList(value: String): Set<Int>? {
         val text = value.trim()
         if (text.isEmpty()) return emptySet()
-        if (text.length > MAX_CPU_TEXT_LENGTH) return null
-
-        val cpus = linkedSetOf<Int>()
-        var expandedCpuCount = 0
-        for (rawPart in text.split(',')) {
-            val bounds = parseSingleCpuRange(rawPart) ?: return null
-            expandedCpuCount += bounds.size
-            if (expandedCpuCount > MAX_CPU_INDEX + 1) return null
-            for (cpu in bounds.first..bounds.last) cpus.add(cpu)
-        }
-        return cpus
+        return parseNativeCpuRangeList(text)
     }
 
     fun formatCpuRangeList(cpus: Set<Int>): String {

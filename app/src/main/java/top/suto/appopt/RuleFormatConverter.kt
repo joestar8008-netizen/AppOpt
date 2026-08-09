@@ -127,9 +127,8 @@ object RuleFormatConverter {
 
         for (group in groups.values) {
             val unsupported = group.rules.firstOrNull { rule ->
-                (rule.thread != null && rule.owner != group.owner) ||
-                    (rule.thread == null && rule.owner != group.owner &&
-                        !rule.owner.startsWith("${group.owner}:"))
+                rule.thread == null && rule.owner != group.owner &&
+                    !rule.owner.startsWith("${group.owner}:")
             }
             if (unsupported != null) {
                 return Result(error = "规则无法写入所选区块格式：${unsupported.canonicalLine}")
@@ -175,22 +174,37 @@ object RuleFormatConverter {
         val runtimeRules = group.rules.filter(::isRuntimeRuleValid)
         val fallback = runtimeRules.firstOrNull { it.owner == group.owner && it.thread == null }
         val threads = runtimeRules.filter { it.owner == group.owner && it.thread != null }
+        // 子进程线程统一使用完整子进程名的独立区块；子进程兜底仍留在主应用区块中。
+        // 这样有无子进程兜底时结构一致，也能与其他区块格式无损互转。
+        val childThreads = runtimeRules.filter { it.owner != group.owner && it.thread != null }
+        val childThreadBlocks = childThreads.groupBy { it.owner }.flatMap { (owner, rules) ->
+            formatGroup(RuleGroup(owner, rules.toMutableList()), format)
+        }
         val children = runtimeRules.filter { it.owner != group.owner && it.thread == null }
         val untypedBlock = format == CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK ||
             format == CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK
-        val legacyOnlyThreads = if (untypedBlock) {
-            threads.filter { isAmbiguousUntypedBlockThread(group.owner, it.thread.orEmpty()) }
-        } else {
-            emptyList()
+        val legacyOnlyThreads = when {
+            untypedBlock -> threads.filter {
+                isAmbiguousUntypedBlockThread(group.owner, it.thread.orEmpty())
+            }
+            else -> emptyList()
         }
         val formattedThreads = if (legacyOnlyThreads.isEmpty()) threads else threads - legacyOnlyThreads.toSet()
-        val members = formattedThreads.size + children.size
+        val legacyOnlyChildren = emptyList<RuleSyntax.Rule>()
+        val formattedChildren = if (legacyOnlyChildren.isEmpty()) {
+            children
+        } else {
+            children - legacyOnlyChildren.toSet()
+        }
+        val members = formattedThreads.size + formattedChildren.size
 
         // 只有主进程兜底时保持单行，避免生成没有实际成员的空区块。
         if (members == 0) {
             return buildList {
                 addAll(legacyOnlyThreads.map(RuleSyntax.Rule::canonicalLine))
                 fallback?.let { add(it.canonicalLine) }
+                addAll(childThreadBlocks)
+                addAll(legacyOnlyChildren.map(RuleSyntax.Rule::canonicalLine))
                 addAll(invalidRules.map(RuleSyntax.Rule::canonicalLine))
             }
         }
@@ -205,7 +219,9 @@ object RuleFormatConverter {
                 output.add("}")
             }
             output.addAll(legacyOnlyThreads.map(RuleSyntax.Rule::canonicalLine))
-            children.forEach { output.add(it.canonicalLine) }
+            formattedChildren.forEach { output.add(it.canonicalLine) }
+            output.addAll(childThreadBlocks)
+            output.addAll(legacyOnlyChildren.map(RuleSyntax.Rule::canonicalLine))
             output.addAll(invalidRules.map(RuleSyntax.Rule::canonicalLine))
             return output
         }
@@ -219,7 +235,8 @@ object RuleFormatConverter {
             )
             CalibPolicy.RuleOutputFormat.NESTED_BLOCK -> output.add("${group.owner}={")
             CalibPolicy.RuleOutputFormat.FUNCTION_BLOCK -> output.add(
-                fallback?.let { "app(${group.owner}, ${it.cpus}) {" } ?: "app(${group.owner}) {"
+                fallback?.let { "app(${formatFunctionName(group.owner)}, ${it.cpus}) {" }
+                    ?: "app(${formatFunctionName(group.owner)}) {"
             )
             CalibPolicy.RuleOutputFormat.YAML -> output.add("${group.owner}:")
             CalibPolicy.RuleOutputFormat.LEGACY,
@@ -232,17 +249,17 @@ object RuleFormatConverter {
         when (format) {
             CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK -> {
                 formattedThreads.forEach { output.add("    ${it.thread}=${it.cpus}") }
-                children.forEach { output.add("    ${it.owner.removePrefix(group.owner)}=${it.cpus}") }
+                formattedChildren.forEach { output.add("    ${it.owner.removePrefix(group.owner)}=${it.cpus}") }
             }
             CalibPolicy.RuleOutputFormat.TAGGED_BLOCK -> {
                 formattedThreads.forEach { output.add("    thread:${it.thread}=${it.cpus}") }
-                children.forEach {
+                formattedChildren.forEach {
                     output.add("    process:${it.owner.removePrefix("${group.owner}:")}=${it.cpus}")
                 }
             }
             CalibPolicy.RuleOutputFormat.NATURAL_BLOCK -> {
                 formattedThreads.forEach { output.add("    thread ${it.thread}=${it.cpus}") }
-                children.forEach {
+                formattedChildren.forEach {
                     output.add("    process ${it.owner.removePrefix("${group.owner}:")}=${it.cpus}")
                 }
             }
@@ -252,18 +269,21 @@ object RuleFormatConverter {
                     formattedThreads.forEach { output.add("        ${it.thread}=${it.cpus}") }
                     output.add("    }")
                 }
-                if (children.isNotEmpty()) {
+                if (formattedChildren.isNotEmpty()) {
                     output.add("    processes {")
-                    children.forEach {
+                    formattedChildren.forEach {
                         output.add("        ${it.owner.removePrefix("${group.owner}:")}=${it.cpus}")
                     }
                     output.add("    }")
                 }
             }
             CalibPolicy.RuleOutputFormat.FUNCTION_BLOCK -> {
-                formattedThreads.forEach { output.add("    thread(${it.thread}, ${it.cpus})") }
-                children.forEach {
-                    output.add("    process(${it.owner.removePrefix("${group.owner}:")}, ${it.cpus})")
+                formattedThreads.forEach {
+                    output.add("    thread(${formatFunctionName(it.thread.orEmpty())}, ${it.cpus})")
+                }
+                formattedChildren.forEach {
+                    val name = it.owner.removePrefix("${group.owner}:")
+                    output.add("    process(${formatFunctionName(name)}, ${it.cpus})")
                 }
             }
             CalibPolicy.RuleOutputFormat.YAML -> {
@@ -271,9 +291,9 @@ object RuleFormatConverter {
                     output.add("    threads:")
                     formattedThreads.forEach { output.add("        ${it.thread}: ${it.cpus}") }
                 }
-                if (children.isNotEmpty()) {
+                if (formattedChildren.isNotEmpty()) {
                     output.add("    processes:")
-                    children.forEach {
+                    formattedChildren.forEach {
                         output.add("        ${it.owner.removePrefix("${group.owner}:")}: ${it.cpus}")
                     }
                 }
@@ -308,8 +328,25 @@ object RuleFormatConverter {
             CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK -> error("旧区块格式只能转换为原作者格式")
         }
         output.addAll(legacyOnlyThreads.map(RuleSyntax.Rule::canonicalLine))
+        output.addAll(childThreadBlocks)
+        output.addAll(legacyOnlyChildren.map(RuleSyntax.Rule::canonicalLine))
         output.addAll(invalidRules.map(RuleSyntax.Rule::canonicalLine))
         return output
+    }
+
+    private fun formatFunctionName(name: String): String {
+        val needsQuotes = name.trim() != name || name.any {
+            it == ',' || it == '(' || it == ')' || it == '"' || it == '\\'
+        }
+        if (!needsQuotes) return name
+        return buildString(name.length + 2) {
+            append('"')
+            name.forEach { ch ->
+                if (ch == '\\' || ch == '"') append('\\')
+                append(ch)
+            }
+            append('"')
+        }
     }
 
     private fun isRuntimeRuleValid(rule: RuleSyntax.Rule): Boolean {

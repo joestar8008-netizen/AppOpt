@@ -1,6 +1,8 @@
 package appopt.pkghelper;
 
+import android.content.ComponentName;
 import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
 import android.os.Build;
 
 import java.io.ByteArrayOutputStream;
@@ -9,11 +11,21 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class PackageHelper {
     private static final int INSTALL_WAIT_MS = 20000;
+    private static final int BINDER_TIMEOUT_MS = 5000;
+    private static final int COMMAND_TIMEOUT_MS = 30000;
+    private static final int COMMAND_OUTPUT_LIMIT = 64 * 1024;
     private static final int POLL_MS = 500;
     private static final int OUTPUT_LIMIT = 600;
+    private static final AtomicBoolean PACKAGE_QUERY_IN_FLIGHT = new AtomicBoolean(false);
+    private static final AtomicBoolean COMPONENT_QUERY_IN_FLIGHT = new AtomicBoolean(false);
 
     private final Object packageManager;
 
@@ -32,6 +44,10 @@ public final class PackageHelper {
             if ("app-info".equals(cmd)) {
                 requireArgs(args, 2);
                 helper.appInfo(args[1]);
+            } else if ("component-state".equals(cmd)) {
+                requireArgs(args, 2);
+                int userId = args.length >= 3 ? (int) parseLong(args[2], 0) : 0;
+                helper.componentState(args[1], userId);
             } else if ("install".equals(cmd)) {
                 requireArgs(args, 2);
                 helper.install(args[1]);
@@ -68,18 +84,49 @@ public final class PackageHelper {
     private static void usage() {
         System.err.println("\u7528\u6cd5:");
         System.err.println("  app-info <package>");
+        System.err.println("  component-state <package/component> [userId]");
         System.err.println("  install <apk>");
     }
 
     private void appInfo(String packageName) throws Exception {
+        PackageInfo info = getPackageInfo(packageName);
         print("ok", "1");
         print("package", packageName);
-        PackageInfo info = getPackageInfo(packageName);
         if (info != null) {
             print("installed", "1");
             printPackageInfo(info);
         } else {
             print("installed", "0");
+        }
+    }
+
+    private void componentState(String flattenedComponent, int userId) throws Exception {
+        ComponentName component = ComponentName.unflattenFromString(flattenedComponent);
+        if (component == null || userId < 0) {
+            throw new IllegalArgumentException("invalid component or userId");
+        }
+        int state = getComponentEnabledSetting(component, userId);
+        print("ok", "1");
+        print("component", component.flattenToShortString());
+        print("user", String.valueOf(userId));
+        print("stateCode", String.valueOf(state));
+        print("state", componentStateName(state));
+    }
+
+    private static String componentStateName(int state) {
+        switch (state) {
+            case PackageManager.COMPONENT_ENABLED_STATE_DEFAULT:
+                return "default";
+            case PackageManager.COMPONENT_ENABLED_STATE_ENABLED:
+                return "enabled";
+            case PackageManager.COMPONENT_ENABLED_STATE_DISABLED:
+                return "disabled";
+            case PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER:
+                return "disabled-user";
+            case PackageManager.COMPONENT_ENABLED_STATE_DISABLED_UNTIL_USED:
+                return "disabled-until-used";
+            default:
+                return "unknown";
         }
     }
 
@@ -128,12 +175,12 @@ public final class PackageHelper {
 
     private CommandResult installByCommands(File file) {
         CommandResult last = installByCmdSession(file);
-        if (last.success) {
+        if (last.success || last.timedOut()) {
             return last;
         }
 
         CommandResult direct = runIfExecutable("/system/bin/pm", "install", "-r", "-d", file.getAbsolutePath());
-        if (direct.success) {
+        if (direct.success || direct.timedOut()) {
             return direct;
         }
         last = direct;
@@ -200,7 +247,109 @@ public final class PackageHelper {
         return false;
     }
 
-    private PackageInfo getPackageInfo(String packageName) throws Exception {
+    private PackageInfo getPackageInfo(final String packageName) throws Exception {
+        if (!PACKAGE_QUERY_IN_FLIGHT.compareAndSet(false, true)) {
+            throw new IOException("previous package manager query is still running");
+        }
+        FutureTask<PackageInfo> task = new FutureTask<>(() -> {
+            try {
+                return getPackageInfoUnchecked(packageName);
+            } finally {
+                // If Binder ignores interruption after a timeout, keep the
+                // in-flight guard set until the old call really returns.
+                PACKAGE_QUERY_IN_FLIGHT.set(false);
+            }
+        });
+        Thread worker = new Thread(task, "AppOptPackageQuery");
+        worker.setDaemon(true);
+        try {
+            worker.start();
+        } catch (RuntimeException error) {
+            PACKAGE_QUERY_IN_FLIGHT.set(false);
+            throw error;
+        }
+        try {
+            return task.get(BINDER_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            task.cancel(true);
+            throw new IOException("package manager query timed out after " + BINDER_TIMEOUT_MS + "ms", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception) {
+                throw (Exception) cause;
+            }
+            if (cause instanceof Error) {
+                throw (Error) cause;
+            }
+            throw e;
+        }
+    }
+
+    private int getComponentEnabledSetting(final ComponentName component, final int userId)
+            throws Exception {
+        if (!COMPONENT_QUERY_IN_FLIGHT.compareAndSet(false, true)) {
+            throw new IOException("previous component state query is still running");
+        }
+        FutureTask<Integer> task = new FutureTask<>(() -> {
+            try {
+                return getComponentEnabledSettingUnchecked(component, userId);
+            } finally {
+                COMPONENT_QUERY_IN_FLIGHT.set(false);
+            }
+        });
+        Thread worker = new Thread(task, "AppOptComponentQuery");
+        worker.setDaemon(true);
+        try {
+            worker.start();
+        } catch (RuntimeException error) {
+            COMPONENT_QUERY_IN_FLIGHT.set(false);
+            throw error;
+        }
+        try {
+            return task.get(BINDER_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            task.cancel(true);
+            throw new IOException("component state query timed out after " + BINDER_TIMEOUT_MS + "ms", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception) {
+                throw (Exception) cause;
+            }
+            if (cause instanceof Error) {
+                throw (Error) cause;
+            }
+            throw e;
+        }
+    }
+
+    private int getComponentEnabledSettingUnchecked(ComponentName component, int userId)
+            throws Exception {
+        for (Method method : packageManager.getClass().getMethods()) {
+            if (!"getComponentEnabledSetting".equals(method.getName())) {
+                continue;
+            }
+            Class<?>[] types = method.getParameterTypes();
+            if (types.length != 2 || types[0] != ComponentName.class || types[1] != int.class) {
+                continue;
+            }
+            try {
+                Object result = method.invoke(packageManager, component, userId);
+                return result instanceof Integer ? (Integer) result : PackageManager.COMPONENT_ENABLED_STATE_DEFAULT;
+            } catch (InvocationTargetException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof Exception) {
+                    throw (Exception) cause;
+                }
+                if (cause instanceof Error) {
+                    throw (Error) cause;
+                }
+                throw e;
+            }
+        }
+        throw new NoSuchMethodException("IPackageManager.getComponentEnabledSetting");
+    }
+
+    private PackageInfo getPackageInfoUnchecked(String packageName) throws Exception {
         for (Method method : packageManager.getClass().getMethods()) {
             if (!"getPackageInfo".equals(method.getName())) {
                 continue;
@@ -254,15 +403,46 @@ public final class PackageHelper {
         try {
             Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
             ByteArrayOutputStream output = new ByteArrayOutputStream();
-            try (InputStream in = process.getInputStream()) {
-                byte[] buffer = new byte[4096];
-                int n;
-                while ((n = in.read(buffer)) >= 0) {
-                    output.write(buffer, 0, n);
+            Thread reader = new Thread(() -> {
+                try (InputStream in = process.getInputStream()) {
+                    byte[] buffer = new byte[4096];
+                    int n;
+                    while ((n = in.read(buffer)) >= 0) {
+                        synchronized (output) {
+                            int remaining = COMMAND_OUTPUT_LIMIT - output.size();
+                            if (remaining > 0) {
+                                output.write(buffer, 0, Math.min(n, remaining));
+                            }
+                        }
+                    }
+                } catch (IOException ignored) {
                 }
+            }, "AppOptInstallOutput");
+            reader.setDaemon(true);
+            reader.start();
+
+            boolean finished = process.waitFor(COMMAND_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            if (!finished) {
+                process.destroyForcibly();
+                try {
+                    process.getInputStream().close();
+                } catch (IOException ignored) {
+                }
+                reader.interrupt();
+                reader.join(1000);
+                String text;
+                synchronized (output) {
+                    text = output.toString("UTF-8");
+                }
+                return CommandResult.failure(commandLine, CommandResult.TIMED_OUT,
+                    text + "\ncommand timed out after " + COMMAND_TIMEOUT_MS + "ms");
             }
-            int exitCode = process.waitFor();
-            String text = output.toString("UTF-8");
+            reader.join(1000);
+            int exitCode = process.exitValue();
+            String text;
+            synchronized (output) {
+                text = output.toString("UTF-8");
+            }
             boolean success = exitCode == 0 && looksSuccessful(text);
             return new CommandResult(commandLine, exitCode, text, success);
         } catch (IOException e) {
@@ -350,6 +530,7 @@ public final class PackageHelper {
 
     private static final class CommandResult {
         static final int MISSING = -127;
+        static final int TIMED_OUT = -3;
 
         final String command;
         final int exitCode;
@@ -369,6 +550,10 @@ public final class PackageHelper {
 
         static CommandResult failure(String command, int exitCode, String output) {
             return new CommandResult(command, exitCode, output, false);
+        }
+
+        boolean timedOut() {
+            return exitCode == TIMED_OUT;
         }
     }
 }

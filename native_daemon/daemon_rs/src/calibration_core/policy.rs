@@ -62,7 +62,6 @@ pub(crate) fn print_version_diagnostics(version: &str) {
         topo.fallback
     );
 
-    sync_policy_topology(&topo);
     let policy_text = fs::read_to_string(CALIB_POLICY_FILE).ok();
     let policy = policy_text
         .as_deref()
@@ -149,6 +148,11 @@ pub(crate) fn print_version_diagnostics(version: &str) {
         fallback_core_source(policy_text.as_deref(), &topo)
     );
     println!("AppOpt 版本 {version}");
+}
+
+pub(crate) fn sync_policy_topology_for_runtime() {
+    let topo = CpuTiers::detect();
+    sync_policy_topology(&topo);
 }
 
 fn parse_policy_for_diagnostics(topo: &CpuTiers, text: &str) -> CalibPolicy {
@@ -405,7 +409,13 @@ fn policy_text(rule: &str, name: &str) -> Option<String> {
     let marker = format!("{name}:");
     let start = rule.find(&marker)? + marker.len();
     let rest = &rule[start..];
-    let end = rest.find(',').unwrap_or(rest.len());
+    // 字段本身以逗号分隔，但 cores 也允许 0-3,5,7 这类非连续列表。
+    // 只能在下一个已知字段标记处结束，不能把核心列表的逗号当成字段边界。
+    let end = [",avg:", ",max:", ",cores:"]
+        .into_iter()
+        .filter_map(|next| rest.find(next))
+        .min()
+        .unwrap_or(rest.len());
     let value = rest[..end].trim();
     if value.is_empty() {
         None
@@ -421,9 +431,6 @@ fn normalize_core_range(value: &str, cpu_count: usize) -> Option<String> {
     }
 
     let mut seen = vec![false; cpu_count.max(1)];
-    let mut min_cpu = usize::MAX;
-    let mut max_cpu = 0usize;
-    let mut count = 0usize;
     for part in value.split(',') {
         let part = part.trim();
         if part.is_empty() {
@@ -444,21 +451,34 @@ fn normalize_core_range(value: &str, cpu_count: usize) -> Option<String> {
             return None;
         }
         for cpu in start..=end {
-            if !seen[cpu] {
-                seen[cpu] = true;
-                count += 1;
-                min_cpu = min_cpu.min(cpu);
-                max_cpu = max_cpu.max(cpu);
-            }
+            seen[cpu] = true;
         }
     }
-    if count == 0 || count != max_cpu - min_cpu + 1 {
-        return None;
+    let cpus = seen
+        .iter()
+        .enumerate()
+        .filter_map(|(cpu, selected)| selected.then_some(cpu))
+        .collect::<Vec<_>>();
+    format_cpu_list(&cpus)
+}
+
+#[cfg(test)]
+mod policy_parser_tests {
+    use super::*;
+
+    #[test]
+    fn non_contiguous_core_lists_survive_policy_parsing() {
+        let rule = "avg:18.0,max:30.0,cores:0-3,5,7";
+        assert_eq!(policy_text(rule, "avg").as_deref(), Some("18.0"));
+        assert_eq!(policy_text(rule, "max").as_deref(), Some("30.0"));
+        assert_eq!(policy_cores(rule, 8).as_deref(), Some("0-3,5,7"));
     }
-    if min_cpu == max_cpu {
-        Some(min_cpu.to_string())
-    } else {
-        Some(format!("{min_cpu}-{max_cpu}"))
+
+    #[test]
+    fn invalid_or_out_of_range_core_lists_are_rejected() {
+        assert_eq!(normalize_core_range("3-1", 8), None);
+        assert_eq!(normalize_core_range("0-3,8", 8), None);
+        assert_eq!(normalize_core_range("0-3,,7", 8), None);
     }
 }
 

@@ -3,6 +3,7 @@
 #
 # 用法：
 #   appopt_pkg_helper.sh app-info top.suto.appopt
+#   appopt_pkg_helper.sh component-state com.xiaomi.joyose/.smartop.SmartOpService 0
 #   appopt_pkg_helper.sh install /data/adb/modules/AppOpt/config/app/AppOpt.apk
 
 DIR="${APP_OPT_HELPER_DIR:-${0%/*}}"

@@ -24,6 +24,7 @@ class FrameRateMonitor(
 ) {
 
     private val fpsFile = File(context.filesDir, FPS_FILENAME)
+    private val socketLock = Any()
     private var observer: FileObserver? = null
     private var server: LocalServerSocket? = null
     private var activeSocket: LocalSocket? = null
@@ -38,6 +39,10 @@ class FrameRateMonitor(
 
     companion object {
         const val FPS_FILENAME = "fps"
+        private const val SOCKET_HELLO_TIMEOUT_MS = 3_000
+        // 客户端通过 hello 后也必须持续发送数据；失联连接不能永久占住唯一接收通道。
+        private const val SOCKET_IDLE_TIMEOUT_MS = 15_000
+        private const val SOCKET_MAX_LINE_LENGTH = 64
     }
 
     fun start() {
@@ -46,9 +51,6 @@ class FrameRateMonitor(
 
         startFileFallback()
         startSocketServer()
-
-        // 启动时先读一次当前值(可能守护进程已经写过), 避免胶囊一直空白。
-        readAndEmitFile()
     }
 
     fun stop() {
@@ -73,9 +75,11 @@ class FrameRateMonitor(
         val token = UUID.randomUUID().toString().replace("-", "")
         try {
             val localServer = LocalServerSocket(name)
-            server = localServer
-            socketName = name
-            socketToken = token
+            synchronized(socketLock) {
+                server = localServer
+                socketName = name
+                socketToken = token
+            }
             Thread({ socketAcceptLoop(localServer, token) }, "AppOptFpsSock").apply {
                 isDaemon = true
                 start()
@@ -95,46 +99,59 @@ class FrameRateMonitor(
                 break
             }
 
-            if (!running) {
+            val accepted = synchronized(socketLock) {
+                if (!running || server !== localServer) {
+                    false
+                } else {
+                    try {
+                        activeSocket?.close()
+                    } catch (_: Exception) {
+                    }
+                    activeSocket = socket
+                    true
+                }
+            }
+            if (!accepted) {
                 try { socket.close() } catch (_: Exception) {}
                 break
             }
-
-            try {
-                activeSocket?.close()
-            } catch (_: Exception) {
-            }
-            activeSocket = socket
             readSocket(socket, token)
         }
     }
 
     private fun readSocket(socket: LocalSocket, token: String) {
         try {
-            socket.soTimeout = 0
+            // 无效客户端不能用一个不发送 hello 的连接永久占住接收线程。
+            socket.soTimeout = SOCKET_HELLO_TIMEOUT_MS
             val reader = BufferedReader(InputStreamReader(socket.inputStream))
             val hello = reader.readLine() ?: return
             if (hello != "hello $token") return
+            socket.soTimeout = SOCKET_IDLE_TIMEOUT_MS
 
             while (running) {
                 val line = reader.readLine() ?: break
+                if (line.length > SOCKET_MAX_LINE_LENGTH) continue
                 val fps = line.trim().toFloatOrNull() ?: continue
                 emitFps(fps)
             }
         } catch (_: Exception) {
         } finally {
-            if (activeSocket === socket) activeSocket = null
+            synchronized(socketLock) {
+                if (activeSocket === socket) activeSocket = null
+            }
             try { socket.close() } catch (_: Exception) {}
         }
     }
 
     private fun closeSocketChannel() {
-        socketName = null
-        socketToken = null
-        try { activeSocket?.close() } catch (_: Exception) {}
-        activeSocket = null
-        try { server?.close() } catch (_: Exception) {}
-        server = null
+        synchronized(socketLock) {
+            socketName = null
+            socketToken = null
+            try { activeSocket?.close() } catch (_: Exception) {}
+            activeSocket = null
+            try { server?.close() } catch (_: Exception) {}
+            server = null
+        }
     }
 
     /**

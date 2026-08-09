@@ -22,42 +22,62 @@ data class ThreadWildcardSuggestion(
     val matchedNames: List<String>
 )
 
+data class OwnedThreadWildcardSuggestion(
+    val owner: String,
+    val suggestion: ThreadWildcardSuggestion
+)
+
 object RuleHistoryCandidates {
-    fun build(baseOwner: String, records: List<RuleHistoryRecord>): List<RuleHistoryCandidate> {
-        if (baseOwner.isBlank()) return emptyList()
+    internal const val MAX_EDITOR_CANDIDATES = 300
+    private const val MAX_CHILD_THREADS_PER_PROCESS = 64
+
+    fun build(
+        baseOwner: String,
+        records: List<RuleHistoryRecord>,
+        maxCandidates: Int = MAX_EDITOR_CANDIDATES
+    ): List<RuleHistoryCandidate> {
+        if (baseOwner.isBlank() || maxCandidates <= 0) return emptyList()
         val candidates = LinkedHashMap<String, RuleHistoryCandidate>()
+        val candidatesPerEpoch = mutableMapOf<Long, Int>()
+        val perEpochBuildLimit = maxCandidates.coerceAtMost(2_000).times(2).coerceAtLeast(64)
 
         fun add(candidate: RuleHistoryCandidate) {
             val key = "${candidate.kind}|${candidate.owner}|${candidate.thread.orEmpty()}"
-            candidates.putIfAbsent(key, candidate)
+            if (key in candidates || (candidatesPerEpoch[candidate.epoch] ?: 0) >= perEpochBuildLimit) {
+                return
+            }
+            candidates[key] = candidate
+            candidatesPerEpoch[candidate.epoch] = (candidatesPerEpoch[candidate.epoch] ?: 0) + 1
         }
 
         for (record in records) {
             val name = record.name.trim()
             if (name.isEmpty()) continue
 
-            if (name.startsWith("$baseOwner:") && !name.contains('{')) {
-                add(
-                    RuleHistoryCandidate(
-                        kind = RuleHistoryKind.CHILD_PROCESS,
-                        owner = name,
-                        thread = null,
-                        avg = record.avg,
-                        max = record.max,
-                        epoch = record.epoch
-                    )
-                )
-                parseChildThreads(record.details).forEach { detail ->
+            if (HistoryFieldCodec.isProcessAggregateRecord(baseOwner, name, record.details)) {
+                if (name.startsWith("$baseOwner:") && !name.contains('{')) {
                     add(
                         RuleHistoryCandidate(
-                            kind = RuleHistoryKind.THREAD,
+                            kind = RuleHistoryKind.CHILD_PROCESS,
                             owner = name,
-                            thread = detail.name,
-                            avg = detail.avg,
-                            max = detail.max,
+                            thread = null,
+                            avg = record.avg,
+                            max = record.max,
                             epoch = record.epoch
                         )
                     )
+                    parseChildThreads(record.details).forEach { detail ->
+                        add(
+                            RuleHistoryCandidate(
+                                kind = RuleHistoryKind.THREAD,
+                                owner = name,
+                                thread = detail.name,
+                                avg = detail.avg,
+                                max = detail.max,
+                                epoch = record.epoch
+                            )
+                        )
+                    }
                 }
                 continue
             }
@@ -81,25 +101,20 @@ object RuleHistoryCandidates {
                 continue
             }
 
-            if (name != baseOwner) {
-                add(
-                    RuleHistoryCandidate(
-                        kind = RuleHistoryKind.THREAD,
-                        owner = baseOwner,
-                        thread = name,
-                        avg = record.avg,
-                        max = record.max,
-                        epoch = record.epoch
-                    )
+            add(
+                RuleHistoryCandidate(
+                    kind = RuleHistoryKind.THREAD,
+                    owner = baseOwner,
+                    thread = name,
+                    avg = record.avg,
+                    max = record.max,
+                    epoch = record.epoch
                 )
-            }
+            )
         }
 
-        return candidates.values.sortedWith(
-            compareByDescending<RuleHistoryCandidate> { it.epoch }
-                .thenByDescending { it.avg ?: -1f }
-                .thenBy { it.thread ?: it.owner }
-        )
+        val sorted = candidates.values.sortedWith(CANDIDATE_ORDER)
+        return takeRecentSessionsFairly(sorted, maxCandidates.coerceAtMost(2_000))
     }
 
     private data class ChildThreadDetail(
@@ -110,17 +125,28 @@ object RuleHistoryCandidates {
 
     private fun parseChildThreads(details: String): List<ChildThreadDetail> {
         if (details.isBlank()) return emptyList()
-        if (!details.startsWith("v2:")) {
+        val payload = HistoryFieldCodec.parseChildDetails(details)
+        if (payload == null) {
             return details.split(',')
+                .asSequence()
                 .map { it.trim() }
                 .filter { it.isNotEmpty() }
+                .take(MAX_CHILD_THREADS_PER_PROCESS)
                 .map { ChildThreadDetail(it, null, null) }
+                .toList()
         }
-        return details.removePrefix("v2:")
+        return payload.body
             .split(';')
+            .asSequence()
+            .take(MAX_CHILD_THREADS_PER_PROCESS)
             .mapNotNull { record ->
                 val parts = record.split(',', limit = 3)
-                val name = parts.getOrNull(0)?.trim().orEmpty()
+                val rawName = parts.getOrNull(0)?.trim().orEmpty()
+                val name = if (payload.encodedNames) {
+                    HistoryFieldCodec.decodeName(rawName)
+                } else {
+                    rawName
+                }
                 if (name.isEmpty()) return@mapNotNull null
                 ChildThreadDetail(
                     name = name,
@@ -128,6 +154,7 @@ object RuleHistoryCandidates {
                     max = parts.getOrNull(2)?.toFloatOrNull()
                 )
             }
+            .toList()
     }
 
     fun suggestThreadWildcard(
@@ -147,37 +174,67 @@ object RuleHistoryCandidates {
             .filter(::rawThreadNameSyntaxOk)
             .distinct()
             .toList()
-        val choice = sameOwnerNames.asSequence()
-            .mapNotNull { ownWildcardCandidate(it, sameOwnerNames) }
-            .distinct()
-            .mapNotNull { candidate ->
-                val regex = generatedWildcardRegex(candidate)
-                if (!regex.matches(exactName)) return@mapNotNull null
-                PatternChoice(
-                    pattern = candidate,
-                    regex = regex,
-                    coverage = sameOwnerNames.count(regex::matches),
-                    requiredAtoms = wildcardRequiredAtoms(candidate),
-                    codePointLength = candidate.codePointCount(0, candidate.length)
+        return buildSuggestion(exactName, sameOwnerNames, buildPatternChoices(sameOwnerNames))
+    }
+
+    fun collectThreadWildcardSuggestions(
+        selected: List<RuleHistoryCandidate>,
+        candidates: List<RuleHistoryCandidate>
+    ): List<OwnedThreadWildcardSuggestion> {
+        val suggestions = linkedMapOf<String, OwnedThreadWildcardSuggestion>()
+        val ownerIndexes = mutableMapOf<String, OwnerWildcardIndex>()
+        selected.asSequence()
+            .filter { it.kind == RuleHistoryKind.THREAD }
+            .forEach { candidate ->
+                val exactName = candidate.thread?.trim().orEmpty()
+                if (!rawThreadNameSyntaxOk(exactName)) return@forEach
+                val index = ownerIndexes.getOrPut(candidate.owner) {
+                    val names = candidates.asSequence()
+                        .filter { it.kind == RuleHistoryKind.THREAD && it.owner == candidate.owner }
+                        .mapNotNull { it.thread?.trim()?.takeIf(String::isNotEmpty) }
+                        .plus(
+                            selected.asSequence()
+                                .filter {
+                                    it.kind == RuleHistoryKind.THREAD && it.owner == candidate.owner
+                                }
+                                .mapNotNull { it.thread?.trim()?.takeIf(String::isNotEmpty) }
+                        )
+                        .filter(::rawThreadNameSyntaxOk)
+                        .distinct()
+                        .toList()
+                    OwnerWildcardIndex(names, buildPatternChoices(names))
+                }
+                val suggestion = buildSuggestion(exactName, index.names, index.choices)
+                    ?: return@forEach
+                val key = "${candidate.owner}\u0000${suggestion.pattern}"
+                suggestions.putIfAbsent(
+                    key,
+                    OwnedThreadWildcardSuggestion(candidate.owner, suggestion)
                 )
             }
-            .sortedWith { left, right -> comparePatternChoices(left, right) }
-            .firstOrNull()
-            ?: return null
-        val pattern = choice.pattern
+        return suggestions.values.toList()
+    }
 
-        val matchedNames = sameOwnerNames
-            .filter(choice.regex::matches)
-            .sortedWith(Comparator(::compareThreadNames))
-        if (exactName !in matchedNames) {
-            return null
+    fun resolveThreadTargets(
+        selected: List<RuleHistoryCandidate>,
+        appliedSuggestions: Collection<OwnedThreadWildcardSuggestion>
+    ): List<Pair<String, String>> {
+        val resolved = linkedMapOf<String, Pair<String, String>>()
+        selected.forEach { candidate ->
+            val name = candidate.thread?.trim().orEmpty()
+            if (candidate.kind == RuleHistoryKind.THREAD && name.isNotEmpty()) {
+                resolved["${candidate.owner}\u0000$name"] = candidate.owner to name
+            }
         }
-
-        return ThreadWildcardSuggestion(
-            exactName = exactName,
-            pattern = pattern,
-            matchedNames = matchedNames
-        )
+        appliedSuggestions.forEach { owned ->
+            val matched = owned.suggestion.matchedNames.toHashSet()
+            resolved.entries.removeAll { (_, target) ->
+                target.first == owned.owner && target.second in matched
+            }
+            val pattern = owned.suggestion.pattern
+            resolved["${owned.owner}\u0000$pattern"] = owned.owner to pattern
+        }
+        return resolved.values.toList()
     }
 
     private data class NumericShape(
@@ -192,6 +249,80 @@ object RuleHistoryCandidates {
         val requiredAtoms: Int,
         val codePointLength: Int
     )
+
+    private data class OwnerWildcardIndex(
+        val names: List<String>,
+        val choices: List<PatternChoice>
+    )
+
+    private fun buildPatternChoices(names: List<String>): List<PatternChoice> {
+        return names.asSequence()
+            .mapNotNull { ownWildcardCandidate(it, names) }
+            .distinct()
+            .map { pattern ->
+                val regex = generatedWildcardRegex(pattern)
+                PatternChoice(
+                    pattern = pattern,
+                    regex = regex,
+                    coverage = names.count(regex::matches),
+                    requiredAtoms = wildcardRequiredAtoms(pattern),
+                    codePointLength = pattern.codePointCount(0, pattern.length)
+                )
+            }
+            .toList()
+    }
+
+    private fun buildSuggestion(
+        exactName: String,
+        names: List<String>,
+        choices: List<PatternChoice>
+    ): ThreadWildcardSuggestion? {
+        val choice = choices.asSequence()
+            .filter { it.regex.matches(exactName) }
+            .minWithOrNull(Comparator(::comparePatternChoices))
+            ?: return null
+        val matchedNames = names
+            .filter(choice.regex::matches)
+            .sortedWith(Comparator(::compareThreadNames))
+        if (exactName !in matchedNames) return null
+        return ThreadWildcardSuggestion(exactName, choice.pattern, matchedNames)
+    }
+
+    private fun takeRecentSessionsFairly(
+        sorted: List<RuleHistoryCandidate>,
+        limit: Int
+    ): List<RuleHistoryCandidate> {
+        if (sorted.size <= limit) return sorted
+        val epochs = sorted.asSequence().map(RuleHistoryCandidate::epoch).distinct().toList()
+        // 正常来源只有最近三个会话。大量不同 epoch 通常来自调用方测试或导入数据，
+        // 此时仍按全局顺序截断，避免为了稀疏数据制造数千个小桶。
+        if (epochs.size !in 2..10) return sorted.take(limit)
+
+        val buckets = sorted.groupBy(RuleHistoryCandidate::epoch)
+        val selected = LinkedHashMap<String, RuleHistoryCandidate>(limit)
+        val perSession = (limit / epochs.size).coerceAtLeast(1)
+        epochs.forEach { epoch ->
+            buckets[epoch].orEmpty().take(perSession).forEach { candidate ->
+                selected[candidateKey(candidate)] = candidate
+            }
+        }
+        if (selected.size < limit) {
+            sorted.forEach { candidate ->
+                if (selected.size >= limit) return@forEach
+                selected.putIfAbsent(candidateKey(candidate), candidate)
+            }
+        }
+        return selected.values.take(limit)
+    }
+
+    private fun candidateKey(candidate: RuleHistoryCandidate): String =
+        "${candidate.kind}\u0000${candidate.owner}\u0000${candidate.thread.orEmpty()}"
+
+    private val CANDIDATE_ORDER =
+        compareByDescending<RuleHistoryCandidate> { it.epoch }
+            .thenByDescending { it.avg ?: -1f }
+            .thenByDescending { it.max ?: -1f }
+            .thenBy { it.thread ?: it.owner }
 
     private fun rawThreadNameSyntaxOk(name: String): Boolean {
         return name.isNotEmpty() && name != "*" && name.none {

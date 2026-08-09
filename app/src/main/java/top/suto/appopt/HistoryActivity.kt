@@ -32,7 +32,7 @@ import java.util.Locale
  *
  * 数据来自守护进程写入的 history/<pkg>.log, 每段:
  *   # <epoch秒> <采样轮数>
- *   <AVG%> <MAX%> <名称>|<p1,p2,...,pN>[|v2:子线程名,AVG,MAX;...]
+ *   <AVG%> <MAX%> <名称>|<p1,p2,...,pN>[|v2:/v3:/v3p:子线程详情]
  */
 class HistoryActivity : AppCompatActivity() {
 
@@ -45,6 +45,10 @@ class HistoryActivity : AppCompatActivity() {
         private const val THREAD_INITIAL_RENDER_SIZE = 12
         private const val THREAD_RENDER_PAGE_SIZE = 24
         private const val THREAD_PRELOAD_DISTANCE_DP = 280f
+        private const val SESSION_RENDER_BATCH_SIZE = 6
+        private const val SESSION_INITIAL_RENDER_SIZE = 20
+        private const val SESSION_RENDER_PAGE_SIZE = 30
+        private const val SESSION_PRELOAD_DISTANCE_DP = 360f
     }
 
     /** 单个线程的负载折线 */
@@ -95,6 +99,7 @@ class HistoryActivity : AppCompatActivity() {
         binding.historyBack.setOnClickListener { finish() }
         binding.historyScroll.setOnScrollChangeListener { _, _, _, _, _ ->
             maybeLoadNextThreadPage()
+            maybeLoadNextSessionPage()
         }
         try {
             binding.historyIcon.setImageDrawable(packageManager.getApplicationIcon(pkg))
@@ -115,23 +120,37 @@ class HistoryActivity : AppCompatActivity() {
     /** 当前展示的包名(删除会话后重新加载用) */
     private var pkg: String = ""
     private var appLabel: String = ""
-    private var reloadGeneration = 0
+    private var reloadRequestGeneration = 0
+    private var renderGeneration = 0
 
     private fun reload(retryIfEmpty: Boolean = true) {
-        val generation = ++reloadGeneration
+        val requestGeneration = ++reloadRequestGeneration
         thread {
-            DatabaseMigrator.migrateIfNeeded(applicationContext, pkg)
-            val db = AppOptDbHelper.getInstance(this)
-            val sessions = db.getSessionSummariesByPackage(pkg).map { summary ->
-                Session(
-                    id = summary.id,
-                    epoch = summary.epoch,
-                    rounds = summary.rounds,
-                    threadCount = summary.threadCount
-                )
+            val result = runCatching {
+                val db = AppOptDbHelper.getInstance(this)
+                runCatching { db.pruneHistory() }
+                    .onFailure { android.util.Log.w("AppOpt", "历史数据库保留策略执行失败", it) }
+                DatabaseMigrator.migrateIfNeeded(applicationContext, pkg)
+                db.getSessionSummariesByPackage(pkg).map { summary ->
+                    Session(
+                        id = summary.id,
+                        epoch = summary.epoch,
+                        rounds = summary.rounds,
+                        threadCount = summary.threadCount
+                    )
+                }
             }
             runOnUiThreadIfAlive {
-                if (generation != reloadGeneration) return@runOnUiThreadIfAlive
+                if (requestGeneration != reloadRequestGeneration) return@runOnUiThreadIfAlive
+                val sessions = result.getOrElse { error ->
+                    android.util.Log.e("AppOpt", "history reload failed: pkg=$pkg", error)
+                    if (binding.sessionContainer.childCount == 0) {
+                        showEmpty("历史记录加载失败\n请稍后重试")
+                    }
+                    toast("历史记录加载失败：${error.message ?: "数据库不可用"}")
+                    return@runOnUiThreadIfAlive
+                }
+                renderGeneration++
                 render(sessions)
                 if (sessions.isEmpty() && retryIfEmpty) {
                     binding.root.postDelayed({
@@ -160,6 +179,10 @@ class HistoryActivity : AppCompatActivity() {
     /** 当前展开的卡片绑定; 每次只展开一张, 点新的先折叠旧的。 */
     private var expandedCard: ItemCalibSessionBinding? = null
     private val threadPageStates = mutableMapOf<ItemCalibSessionBinding, ThreadPageState>()
+    private var sessionItems: List<Session> = emptyList()
+    private var sessionNextIndex = 0
+    private var sessionRendering = false
+    private var sessionLoadMoreView: View? = null
 
     private fun setCardExpanded(card: ItemCalibSessionBinding, expanded: Boolean) {
         card.threadRows.visibility = if (expanded) View.VISIBLE else View.GONE
@@ -169,6 +192,13 @@ class HistoryActivity : AppCompatActivity() {
     }
 
     private fun render(sessions: List<Session>) {
+        sessionItems = sessions
+        sessionNextIndex = 0
+        sessionRendering = false
+        sessionLoadMoreView = null
+        binding.sessionContainer.removeAllViews()
+        expandedCard = null
+        threadPageStates.clear()
         if (sessions.isEmpty()) {
             showEmpty("暂无历史记录\n\n进入应用后用悬浮球完成一次校准即可生成记录")
             return
@@ -176,13 +206,61 @@ class HistoryActivity : AppCompatActivity() {
         binding.historyEmpty.visibility = View.GONE
         binding.sessionContainer.visibility = View.VISIBLE
         binding.historyCount.text = "${sessions.size} 次校准"
-        binding.sessionContainer.removeAllViews()
-        expandedCard = null
-        threadPageStates.clear()
-        val inflater = LayoutInflater.from(this)
+        renderNextSessionPage()
+    }
 
-        for (s in sessions) {
-            val card = ItemCalibSessionBinding.inflate(inflater, binding.sessionContainer, false)
+    private fun renderNextSessionPage() {
+        if (sessionRendering || sessionNextIndex >= sessionItems.size ||
+            isThreadRenderStale(renderGeneration)) {
+            return
+        }
+        sessionRendering = true
+        sessionLoadMoreView?.let(binding.sessionContainer::removeView)
+        sessionLoadMoreView = null
+        val pageSize = if (sessionNextIndex == 0) {
+            SESSION_INITIAL_RENDER_SIZE
+        } else {
+            SESSION_RENDER_PAGE_SIZE
+        }
+        val endIndex = minOf(sessionNextIndex + pageSize, sessionItems.size)
+        val generation = renderGeneration
+        renderSessionBatch(
+            inflater = LayoutInflater.from(this),
+            startIndex = sessionNextIndex,
+            endIndex = endIndex,
+            generation = generation
+        ) {
+            sessionNextIndex = endIndex
+            sessionRendering = false
+            if (sessionNextIndex < sessionItems.size) addSessionLoadMoreView()
+        }
+    }
+
+    private fun renderSessionBatch(
+        inflater: LayoutInflater,
+        startIndex: Int,
+        endIndex: Int,
+        generation: Int,
+        onDone: () -> Unit
+    ) {
+        if (isThreadRenderStale(generation)) return
+        val batchEnd = minOf(startIndex + SESSION_RENDER_BATCH_SIZE, endIndex)
+        for (index in startIndex until batchEnd) {
+            bindSessionCard(sessionItems[index], inflater)
+        }
+        if (batchEnd < endIndex) {
+            binding.sessionContainer.post {
+                if (!isThreadRenderStale(generation)) {
+                    renderSessionBatch(inflater, batchEnd, endIndex, generation, onDone)
+                }
+            }
+        } else {
+            onDone()
+        }
+    }
+
+    private fun bindSessionCard(s: Session, inflater: LayoutInflater) {
+        val card = ItemCalibSessionBinding.inflate(inflater, binding.sessionContainer, false)
             card.sessionDate.text = formatHistoryDate(s.epoch)
             card.sessionTime.text = formatHistoryClock(s.epoch)
             // round_count = 采样轮数, 每轮间隔 0.5 秒; 显示成采样时长
@@ -205,7 +283,38 @@ class HistoryActivity : AppCompatActivity() {
             }
             card.sessionManage.setOnClickListener { showSessionManageSheet(s) }
             binding.sessionContainer.addView(card.root)
+    }
+
+    private fun addSessionLoadMoreView() {
+        if (isThreadRenderStale(renderGeneration)) return
+        val remaining = sessionItems.size - sessionNextIndex
+        val nextCount = minOf(SESSION_RENDER_PAGE_SIZE, remaining)
+        val more = android.widget.TextView(this).apply {
+            text = "继续加载 $nextCount 次记录 · 剩余 $remaining 次"
+            gravity = Gravity.CENTER
+            setTextColor(ContextCompat.getColor(this@HistoryActivity, R.color.brand_primary))
+            textSize = 12f
+            setPadding(0, dp(14f), 0, dp(14f))
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { renderNextSessionPage() }
         }
+        sessionLoadMoreView = more
+        binding.sessionContainer.addView(more)
+        binding.sessionContainer.post { maybeLoadNextSessionPage() }
+    }
+
+    private fun maybeLoadNextSessionPage() {
+        if (sessionRendering) return
+        val marker = sessionLoadMoreView ?: return
+        if (!marker.isShown) return
+        val markerPosition = IntArray(2)
+        val scrollPosition = IntArray(2)
+        marker.getLocationOnScreen(markerPosition)
+        binding.historyScroll.getLocationOnScreen(scrollPosition)
+        val preloadBottom = scrollPosition[1] + binding.historyScroll.height +
+            dp(SESSION_PRELOAD_DISTANCE_DP)
+        if (markerPosition[1] <= preloadBottom) renderNextSessionPage()
     }
 
     private fun showSessionManageSheet(session: Session) {
@@ -248,21 +357,39 @@ class HistoryActivity : AppCompatActivity() {
 
     private fun deleteSession(sessionId: Long) {
         thread {
-            val db = AppOptDbHelper.getInstance(this)
-            db.deleteSession(sessionId)
+            val result = runCatching {
+                val db = AppOptDbHelper.getInstance(this)
+                check(db.deleteSession(sessionId) > 0) { "记录已不存在" }
+            }
             runOnUiThreadIfAlive {
-                toast("已删除记录")
-                reload()
+                result.fold(
+                    onSuccess = {
+                        toast("已删除记录")
+                        reload()
+                    },
+                    onFailure = { error ->
+                        android.util.Log.e(
+                            "AppOpt",
+                            "history session delete failed: session=$sessionId",
+                            error
+                        )
+                        toast("删除失败：${error.message ?: "数据库不可用"}")
+                    }
+                )
             }
         }
     }
 
     private fun exportSession(session: Session) {
         thread {
-            val db = AppOptDbHelper.getInstance(this)
-            val threads = db.getThreadsBySessionId(session.id)
-            val text = buildSessionExportText(session, threads)
-            val result = writeSessionExportFile(session, text)
+            val result = runCatching {
+                val db = AppOptDbHelper.getInstance(this)
+                val threads = db.getThreadsBySessionId(session.id)
+                buildSessionExportText(session, threads)
+            }.fold(
+                onSuccess = { text -> writeSessionExportFile(session, text) },
+                onFailure = { error -> Result.failure(error) }
+            )
             runOnUiThreadIfAlive {
                 result.fold(
                     onSuccess = { toast("已导出到 $it") },
@@ -286,7 +413,7 @@ class HistoryActivity : AppCompatActivity() {
             appendLine("负载记录:")
             appendLine("AVG%  MAX%  类型    名称")
             for (t in threads) {
-                val childProcess = isChildProcessLoad(t.name)
+                val childProcess = isChildProcessLoad(t.name, t.details)
                 appendLine(
                     String.format(
                         Locale.US,
@@ -294,7 +421,7 @@ class HistoryActivity : AppCompatActivity() {
                         t.avg,
                         t.max,
                         if (childProcess) "子进程" else "线程",
-                        displayLoadName(t.name)
+                        displayLoadName(t.name, t.details)
                     )
                 )
                 val childThreads = parseChildThreadLoads(t.details)
@@ -392,7 +519,7 @@ class HistoryActivity : AppCompatActivity() {
 
     private fun ensureThreadsLoaded(card: ItemCalibSessionBinding, sessionId: Long, durationSec: Int) {
         if (card.threadRows.childCount > 0) return
-        val generation = reloadGeneration
+        val generation = renderGeneration
         card.threadRows.removeAllViews()
         val loading = android.widget.TextView(this).apply {
             text = "加载中..."
@@ -531,7 +658,7 @@ class HistoryActivity : AppCompatActivity() {
         for (i in startIndex until nextIndex) {
             val tl = loads[i]
             val row = ItemThreadLoadBinding.inflate(inflater, card.threadRows, false)
-            val isChildProcess = isChildProcessLoad(tl.name)
+            val isChildProcess = isChildProcessLoad(tl.name, tl.details)
             row.loadType.text = if (isChildProcess) "子进程" else "线程"
             row.loadType.setBackgroundResource(
                 if (isChildProcess) R.drawable.bg_rule_type_main else R.drawable.bg_rule_type_thread
@@ -542,9 +669,9 @@ class HistoryActivity : AppCompatActivity() {
                     if (isChildProcess) R.color.brand_secondary else R.color.brand_primary_dark
                 )
             )
-            row.threadName.text = displayLoadName(tl.name)
+            row.threadName.text = displayLoadName(tl.name, tl.details)
             row.threadName.setOnLongClickListener {
-                copyLoadName(tl.name)
+                copyLoadName(tl.name, tl.details)
                 true
             }
             val childThreads = parseChildThreadLoads(tl.details)
@@ -583,11 +710,20 @@ class HistoryActivity : AppCompatActivity() {
     }
 
     private fun isThreadRenderStale(generation: Int): Boolean {
-        return isFinishing || isDestroyed || generation != reloadGeneration
+        return isFinishing || isDestroyed || generation != renderGeneration
     }
 
     private fun isThreadRenderStale(card: ItemCalibSessionBinding, generation: Int): Boolean {
         return isThreadRenderStale(generation) || card.root.parent == null
+    }
+
+    override fun onDestroy() {
+        renderGeneration++
+        reloadRequestGeneration++
+        sessionRendering = false
+        sessionLoadMoreView = null
+        threadPageStates.clear()
+        super.onDestroy()
     }
 
     private fun ThreadData.toThreadLoad(): ThreadLoad {
@@ -602,17 +738,23 @@ class HistoryActivity : AppCompatActivity() {
 
     private fun parseChildThreadLoads(details: String): List<ChildThreadLoad> {
         if (details.isBlank()) return emptyList()
-        if (!details.startsWith("v2:")) {
+        val payload = HistoryFieldCodec.parseChildDetails(details)
+        if (payload == null) {
             return details.split(',')
                 .map { it.trim() }
                 .filter { it.isNotEmpty() }
                 .map { ChildThreadLoad(it, null, null) }
         }
-        return details.removePrefix("v2:")
+        return payload.body
             .split(';')
             .mapNotNull { record ->
                 val parts = record.split(',', limit = 3)
-                val name = parts.getOrNull(0)?.trim().orEmpty()
+                val rawName = parts.getOrNull(0)?.trim().orEmpty()
+                val name = if (payload.encodedNames) {
+                    HistoryFieldCodec.decodeName(rawName)
+                } else {
+                    rawName
+                }
                 val avg = parts.getOrNull(1)?.toFloatOrNull()
                 val max = parts.getOrNull(2)?.toFloatOrNull()
                 if (name.isEmpty() || avg == null || max == null) null
@@ -645,7 +787,7 @@ class HistoryActivity : AppCompatActivity() {
                     )
                     item.childThreadName.text = load.name
                     item.childThreadName.setOnLongClickListener {
-                        copyLoadName(load.name)
+                        copyLoadName(load.name, "")
                         true
                     }
                     item.childThreadAvg.text = load.avg?.let {
@@ -664,22 +806,22 @@ class HistoryActivity : AppCompatActivity() {
         }
     }
 
-    private fun displayLoadName(name: String): String {
-        return if (isChildProcessLoad(name)) {
+    private fun displayLoadName(name: String, details: String): String {
+        return if (isChildProcessLoad(name, details)) {
             name.removePrefix(pkg)
         } else {
             name
         }
     }
 
-    private fun isChildProcessLoad(name: String): Boolean {
-        return name.startsWith("$pkg:") && !name.contains('{')
+    private fun isChildProcessLoad(name: String, details: String): Boolean {
+        return HistoryFieldCodec.isProcessAggregateRecord(pkg, name, details)
     }
 
-    private fun copyLoadName(name: String) {
+    private fun copyLoadName(name: String, details: String) {
         val clipboard = getSystemService(ClipboardManager::class.java)
         clipboard.setPrimaryClip(ClipData.newPlainText("AppOpt 负载名称", name))
-        val isChildProcess = isChildProcessLoad(name)
+        val isChildProcess = isChildProcessLoad(name, details)
         toast(if (isChildProcess) "已复制子进程名" else "已复制线程名")
     }
 

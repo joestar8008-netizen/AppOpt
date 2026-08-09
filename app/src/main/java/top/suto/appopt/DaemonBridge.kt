@@ -3,8 +3,8 @@ package top.suto.appopt
 import android.net.LocalServerSocket
 import android.os.SystemClock
 import java.io.BufferedReader
-import java.io.DataOutputStream
 import java.io.InputStreamReader
+import java.io.OutputStreamWriter
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
@@ -41,6 +41,7 @@ object DaemonBridge {
     private const val STATE_FILE = "$CONFIG_DIR/calibrate.state"
     private const val CONFIG_FILE = "$CONFIG_DIR/applist.conf"
     private const val RULE_HEALTH_FILE = "$RUNTIME_STATE_DIR/rule_health.tsv"
+    private const val RULE_HEALTH_RESET_FILE = "$RUNTIME_STATE_DIR/rule_health.reset"
     private const val JANK_BOOST_FILE = "$CONFIG_DIR/jank_boost.conf"
     private const val JANK_BOOST_LOCK_DIR = "$CONFIG_DIR/jank_boost.conf.lock"
     private const val CONFIG_LOCK_DIR = "$CONFIG_DIR/applist.conf.lock"
@@ -54,19 +55,196 @@ object DaemonBridge {
     private const val FPS_CMD_FILE = "$CONFIG_DIR/fps.cmd"
     private const val FOREGROUND_TASK_STATE_FILE = "$CONFIG_DIR/foreground_task.state"
     private const val FOREGROUND_HELPER_SCRIPT = "$CONFIG_DIR/tools/appopt_foreground_helper.sh"
+    private const val SCENE_DATA_DIR = "/data/user/0/com.omarea.vtools"
+    private const val SCENE_CPUSET_CONFIG = "$SCENE_DATA_DIR/files/features/cpuset.conf"
+    private const val SCENE_STATUS_KEY = "__appopt_scene_status"
     private const val FOREGROUND_TASK_MAX_AGE_MS = 12_000L
     private const val DAEMON_SOCKET_CALLBACK_PREFIX = "appopt.callback top.suto.appopt v1 "
     private const val ROOT_TIMEOUT_SECONDS = 15L
-    const val REQUIRED_MODULE_VERSION_CODE = 185
-    const val REQUIRED_MODULE_VERSION_NAME = "1.8.5"
+    const val REQUIRED_MODULE_VERSION_CODE = 186
+    const val REQUIRED_MODULE_VERSION_NAME = "1.8.6"
     private val configMutationLock = Any()
 
     /** 检测设备是否有可用 root；首次调用可能触发 Magisk 授权弹窗。 */
     fun hasRoot(): Boolean = runAsRoot("id -u").trim() == "0"
 
     fun hasPendingModuleUpdate(): Boolean {
-        return runAsRoot("[ -d '$MODULE_UPDATE_DIR' ] && printf 1 || printf 0")
+        val command = """
+            prop='$MODULE_UPDATE_DIR/module.prop'
+            id=
+            code=
+            [ -f "${'$'}prop" ] && id=${'$'}(sed -n 's/^id=//p' "${'$'}prop" 2>/dev/null | head -n 1)
+            [ -f "${'$'}prop" ] && code=${'$'}(sed -n 's/^versionCode=//p' "${'$'}prop" 2>/dev/null | head -n 1)
+            if [ "${'$'}id" = 'AppOpt' ] &&
+                [ -n "${'$'}code" ] && [ "${'$'}{code#*[!0-9]}" = "${'$'}code" ] && [ "${'$'}code" -gt 0 ] 2>/dev/null &&
+                [ -f '$MODULE_UPDATE_DIR/service.sh' ] &&
+                [ -f '$MODULE_UPDATE_DIR/config/bin/AppOptRs' ]; then
+                printf 1
+            else
+                printf 0
+            fi
+        """.trimIndent()
+        return runAsRoot(command)
             .trim() == "1"
+    }
+
+    fun readSceneCoreAllocationState(
+        namespacePid: Int?,
+        sceneInstalled: Boolean?
+    ): SceneCoreAllocationState {
+        if (sceneInstalled == false) {
+            return SceneCoreAllocationState(
+                availability = SceneCoreAllocationAvailability.NOT_INSTALLED
+            )
+        }
+        if (sceneInstalled == null) {
+            return SceneCoreAllocationState(
+                availability = SceneCoreAllocationAvailability.UNKNOWN
+            )
+        }
+        val rootPrefix = namespacePid?.takeIf { it > 0 }?.let { "/proc/$it/root" }.orEmpty()
+        val namespacedDataDir = "$rootPrefix$SCENE_DATA_DIR"
+        val namespacedConfig = "$rootPrefix$SCENE_CPUSET_CONFIG"
+        val command = """
+            if [ -n '$rootPrefix' ] && [ -d '$namespacedDataDir' ]; then
+                if [ -f '$namespacedConfig' ]; then
+                    printf '$SCENE_STATUS_KEY=available\n'
+                    cat '$namespacedConfig' || exit 1
+                else
+                    printf '$SCENE_STATUS_KEY=config_missing\n'
+                fi
+            elif [ -d '$SCENE_DATA_DIR' ]; then
+                if [ -f '$SCENE_CPUSET_CONFIG' ]; then
+                    printf '$SCENE_STATUS_KEY=available\n'
+                    cat '$SCENE_CPUSET_CONFIG' || exit 1
+                else
+                    printf '$SCENE_STATUS_KEY=config_missing\n'
+                fi
+            else
+                printf '$SCENE_STATUS_KEY=read_error\n'
+            fi
+        """.trimIndent()
+        val result = runRootCommand(command, timeoutSeconds = 3L)
+        return if (result.success) {
+            parseSceneCoreAllocationState(result.output)
+        } else {
+            SceneCoreAllocationState(
+                availability = SceneCoreAllocationAvailability.READ_ERROR,
+                raw = result.output
+            )
+        }
+    }
+
+    fun disableSceneCoreAllocation(
+        namespacePid: Int?,
+        target: SceneCoreAllocationTarget
+    ): SceneCoreAllocationUpdateResult {
+        val key = target.configKey
+        val innerCommand = """
+            config='$SCENE_CPUSET_CONFIG'
+            dir=${'$'}{config%/*}
+            tmp="${'$'}dir/.cpuset.conf.appopt.${'$'}${'$'}"
+            content="${'$'}tmp.content"
+            cleanup_scene_tmp() { rm -f "${'$'}tmp" "${'$'}content"; }
+            trap 'cleanup_scene_tmp' EXIT HUP INT TERM
+            cleanup_scene_tmp
+            if ! grep -q '^$key=' "${'$'}config"; then
+                exit 4
+            fi
+            if ! cp -p "${'$'}config" "${'$'}tmp" ||
+                ! sed 's/^$key=.*/$key=0/' "${'$'}config" > "${'$'}content" ||
+                ! cat "${'$'}content" > "${'$'}tmp"; then
+                exit 5
+            fi
+            sync "${'$'}tmp" 2>/dev/null || sync
+            if ! mv -f "${'$'}tmp" "${'$'}config"; then
+                exit 6
+            fi
+            rm -f "${'$'}content"
+            trap - EXIT HUP INT TERM
+            grep -q '^$key=0${'$'}' "${'$'}config"
+        """.trimIndent()
+        val innerQuoted = shellQuote(innerCommand)
+        val daemonBin = shellQuote(BIN_RS_FILE)
+        val command = """
+            find_scene_pid() {
+                for proc_dir in /proc/[0-9]*; do
+                    [ -r "${'$'}proc_dir/cmdline" ] || continue
+                    name=${'$'}(tr '\000' '\n' < "${'$'}proc_dir/cmdline" 2>/dev/null | head -n 1)
+                    [ "${'$'}name" = 'com.omarea.vtools' ] || continue
+                    printf '%s\n' "${'$'}{proc_dir##*/}"
+                    return 0
+                done
+                return 1
+            }
+            scene_pid=$(${daemonBin} --find-pid com.omarea.vtools 2>/dev/null | head -n 1)
+            [ -n "${'$'}scene_pid" ] || scene_pid=${'$'}(find_scene_pid)
+            if [ -z "${'$'}scene_pid" ]; then
+                am broadcast --user 0 \
+                    -n com.omarea.vtools/com.omarea.scene_mode.ReceiverShortcut \
+                    -f 0x20 \
+                    >/dev/null 2>&1
+                retry=0
+                while [ "${'$'}retry" -lt 10 ] && [ -z "${'$'}scene_pid" ]; do
+                    sleep 0.1
+                    scene_pid=${'$'}(find_scene_pid)
+                    retry=${'$'}((retry + 1))
+                done
+            fi
+            [ -n "${'$'}scene_pid" ] || exit 3
+            if command -v nsenter >/dev/null 2>&1 &&
+                nsenter -t "${'$'}scene_pid" -m -- /system/bin/sh -c $innerQuoted; then
+                exit 0
+            fi
+            su -t "${'$'}scene_pid" -c $innerQuoted
+        """.trimIndent()
+        val result = runRootCommand(command, timeoutSeconds = 3L)
+        val state = readSceneCoreAllocationState(namespacePid, sceneInstalled = true)
+        val disabled = when (target) {
+            SceneCoreAllocationTarget.APPS -> state.inApps == false
+            SceneCoreAllocationTarget.GAMES -> state.inGames == false
+        }
+        val success = result.success &&
+            state.availability == SceneCoreAllocationAvailability.AVAILABLE && disabled
+        val error = when {
+            success -> ""
+            result.timedOut -> "Root 操作超时"
+            !result.success -> result.output.trim().ifBlank { "无法写入 Scene 配置" }
+            state.availability == SceneCoreAllocationAvailability.CONFIG_MISSING -> "未检测到 Scene 配置"
+            state.availability == SceneCoreAllocationAvailability.READ_ERROR -> "无法读取 Scene 配置"
+            else -> "Scene 未保存该开关状态"
+        }
+        return SceneCoreAllocationUpdateResult(success, state, error)
+    }
+
+    internal fun parseSceneCoreAllocationState(raw: String): SceneCoreAllocationState {
+        val values = raw.lineSequence()
+            .mapNotNull { line ->
+                val separator = line.indexOf('=')
+                if (separator <= 0) null else {
+                    line.substring(0, separator).trim() to line.substring(separator + 1).trim()
+                }
+            }
+            .toMap()
+        val availability = when (values[SCENE_STATUS_KEY]) {
+            "available" -> SceneCoreAllocationAvailability.AVAILABLE
+            "not_installed" -> SceneCoreAllocationAvailability.NOT_INSTALLED
+            "config_missing" -> SceneCoreAllocationAvailability.CONFIG_MISSING
+            else -> SceneCoreAllocationAvailability.READ_ERROR
+        }
+        return SceneCoreAllocationState(
+            availability = availability,
+            inApps = values["in_apps"].toSceneBooleanOrNull(),
+            inGames = values["in_games"].toSceneBooleanOrNull(),
+            usePresets = values["use_presets"].toSceneBooleanOrNull(),
+            raw = raw
+        )
+    }
+
+    private fun String?.toSceneBooleanOrNull(): Boolean? = when (this?.lowercase(Locale.US)) {
+        "1", "true", "on", "yes" -> true
+        "0", "false", "off", "no" -> false
+        else -> null
     }
 
     data class ModuleVersion(
@@ -81,6 +259,25 @@ object DaemonBridge {
         val success: Boolean,
         val timedOut: Boolean = false
     )
+
+    enum class CalibrationStartStatus {
+        STARTED,
+        BUSY,
+        INVALID_PACKAGE,
+        ROOT_TIMEOUT,
+        ROOT_COMMAND_FAILED,
+        TARGET_PROCESS_NOT_READY,
+        TARGET_PROCESS_EXITED,
+        DAEMON_NO_RESPONSE
+    }
+
+    data class CalibrationStartResult(
+        val status: CalibrationStartStatus,
+        val state: String = ""
+    ) {
+        val started: Boolean
+            get() = status == CalibrationStartStatus.STARTED
+    }
 
     data class TopAppState(
         val targetTopApp: Boolean,
@@ -104,6 +301,7 @@ object DaemonBridge {
         val reason: String,
         val selection: String,
         val error: String,
+        val sceneInstalled: Boolean?,
         val raw: String
     )
 
@@ -112,6 +310,37 @@ object DaemonBridge {
         val versionName: String? = null,
         val pid: Int? = null,
         val raw: String = ""
+    )
+
+    enum class SceneCoreAllocationAvailability {
+        UNKNOWN,
+        AVAILABLE,
+        NOT_INSTALLED,
+        CONFIG_MISSING,
+        READ_ERROR
+    }
+
+    enum class SceneCoreAllocationTarget(val configKey: String) {
+        APPS("in_apps"),
+        GAMES("in_games")
+    }
+
+    data class SceneCoreAllocationState(
+        val availability: SceneCoreAllocationAvailability,
+        val inApps: Boolean? = null,
+        val inGames: Boolean? = null,
+        val usePresets: Boolean? = null,
+        val raw: String = ""
+    ) {
+        val enabled: Boolean
+            get() = availability == SceneCoreAllocationAvailability.AVAILABLE &&
+                (inApps == true || inGames == true)
+    }
+
+    data class SceneCoreAllocationUpdateResult(
+        val success: Boolean,
+        val state: SceneCoreAllocationState,
+        val error: String = ""
     )
 
     enum class RuleHealthStatus {
@@ -136,6 +365,93 @@ object DaemonBridge {
     }
 
     fun readRuleHealth(): Map<String, RuleHealth> = readRuleHealthOrNull().orEmpty()
+
+    /** 请求守护进程把指定应用的异常规则恢复为待检测状态。 */
+    fun requestRuleHealthReset(pkg: String): Boolean = synchronized(configMutationLock) {
+        val basePkg = normalizeRuleHealthResetPackage(pkg) ?: return@synchronized false
+        val content = "$basePkg\n"
+        val b64 = android.util.Base64.encodeToString(
+            content.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP
+        )
+        val token = UUID.randomUUID().toString()
+        readRootCommandResult(buildRuleHealthResetWriteCommand(b64, token)).success
+    }
+
+    /** App 只原子追加请求文件；rule_health.tsv 始终由守护进程独占写入。 */
+    internal fun buildRuleHealthResetWriteCommand(encodedContent: String, token: String): String {
+        val tmp = "$RULE_HEALTH_RESET_FILE.app-$token.tmp"
+        return """
+            state='$RUNTIME_STATE_DIR'
+            target='$RULE_HEALTH_RESET_FILE'
+            tmp='$tmp'
+            mkdir -p "${'$'}state" || exit 1
+            trap 'rm -f "${'$'}tmp"' EXIT
+            if [ -f "${'$'}target" ]; then
+                if ! cat "${'$'}target" > "${'$'}tmp"; then
+                    [ ! -e "${'$'}target" ] || exit 1
+                    : > "${'$'}tmp" || exit 1
+                fi
+                [ ! -s "${'$'}tmp" ] || [ "${'$'}(tail -c 1 "${'$'}tmp" 2>/dev/null)" = '' ] ||
+                    printf '\n' >> "${'$'}tmp" || exit 1
+            elif [ -e "${'$'}target" ]; then
+                exit 1
+            else
+                : > "${'$'}tmp" || exit 1
+            fi
+            if ! base64 -d >> "${'$'}tmp" << 'EOF_BASE64'
+            $encodedContent
+            EOF_BASE64
+            then
+                exit 1
+            fi
+            chmod 0644 "${'$'}tmp" 2>/dev/null || true
+            chown 0:0 "${'$'}tmp" 2>/dev/null || true
+            mv -f "${'$'}tmp" "${'$'}target" || exit 1
+        """.trimIndent()
+    }
+
+    internal fun normalizeRuleHealthResetPackage(value: String): String? {
+        val basePkg = value.trim().removePrefix("\uFEFF").substringBefore(':').trim()
+        if (basePkg.isEmpty() ||
+            basePkg.toByteArray(Charsets.UTF_8).size > RuleConfigLogic.MAX_OWNER_BYTES ||
+            basePkg.startsWith('.') || basePkg.endsWith('.') ||
+            basePkg.split('.').any(String::isEmpty) ||
+            basePkg.any {
+                it !in 'a'..'z' && it !in 'A'..'Z' && it !in '0'..'9' && it != '_' && it != '.'
+            }) {
+            return null
+        }
+        return basePkg
+    }
+
+    /** 守护进程认领请求前先乐观更新界面，稍后的状态复读会校正最终结果。 */
+    internal fun markRuleHealthResetPending(
+        health: Map<String, RuleHealth>,
+        pkg: String
+    ): Map<String, RuleHealth> {
+        val basePkg = normalizeRuleHealthResetPackage(pkg) ?: return health
+        var changed = false
+        val updated = LinkedHashMap<String, RuleHealth>(health.size)
+        health.forEach { (key, entry) ->
+            val resetEntry = entry.status != RuleHealthStatus.VALID &&
+                !(entry.status == RuleHealthStatus.PENDING && entry.missCount == 0) &&
+                normalizeRuleHealthResetPackage(entry.owner) == basePkg
+            val next = if (resetEntry) {
+                changed = true
+                entry.copy(
+                    status = RuleHealthStatus.PENDING,
+                    missCount = 0,
+                    firstObservedAt = 0L,
+                    lastMatchedAt = 0L,
+                    lastCheckedAt = 0L
+                )
+            } else {
+                entry
+            }
+            updated[key] = next
+        }
+        return if (changed) updated else health
+    }
 
     /** 读取已开启卡顿自动增强的基础包名；文件不存在等同于全部关闭。 */
     fun readJankBoostPackages(): Set<String>? {
@@ -323,25 +639,15 @@ object DaemonBridge {
         return runAsRootStreaming(cmd, timeoutSeconds.coerceAtLeast(1L), onOutput)
     }
 
-    /**
-     * 读取已刷入模块版本。兼容性判断只看 module.prop 的 versionCode；
-     * Rust 二进制 `AppOptRs -v` 仅作为辅助显示信息, 不决定模块版本是否合格。
-     */
+    /** 只读 module.prop 获取已刷入模块版本，不触发守护进程的策略同步或其他写操作。 */
     fun readModuleVersion(): ModuleVersion? {
-        val daemonBin = shellQuote(BIN_RS_FILE)
         val cmd = """
             prop="$MODULE_DIR/module.prop"
             prop_code=
             prop_version=
-            bin_version=
             [ -f "${'$'}prop" ] && prop_code=${'$'}(sed -n 's/^versionCode=//p' "${'$'}prop" 2>/dev/null | head -n 1)
             [ -f "${'$'}prop" ] && prop_version=${'$'}(sed -n 's/^version=//p' "${'$'}prop" 2>/dev/null | head -n 1)
-            daemon_bin=$daemonBin
-            if [ -x "${'$'}daemon_bin" ]; then
-                bin_out=$("${'$'}daemon_bin" -v 2>/dev/null)
-                bin_version=${'$'}(printf '%s\n' "${'$'}bin_out" | sed -n 's/.*AppOpt 版本[[:space:]]*//p' | tail -n 1)
-            fi
-            printf 'propCode=%s\npropVersion=%s\nbinVersion=%s\n' "${'$'}prop_code" "${'$'}prop_version" "${'$'}bin_version"
+            printf 'propCode=%s\npropVersion=%s\n' "${'$'}prop_code" "${'$'}prop_version"
         """.trimIndent()
         val out = runAsRoot(cmd)
         if (!out.isNotErrored()) return null
@@ -351,16 +657,14 @@ object DaemonBridge {
                 if (index <= 0) null else line.substring(0, index) to line.substring(index + 1).trim()
             }
             .toMap()
-        val binVersion = values["binVersion"].orEmpty().removePrefix("v").trim()
         val propVersion = values["propVersion"].orEmpty().removePrefix("v").trim()
         val code = values["propCode"]?.toIntOrNull() ?: return null
         val name = propVersion.takeIf { it.isNotBlank() }
-            ?: binVersion.takeIf { it.isNotBlank() }
             ?: code.toString()
         return ModuleVersion(
             versionName = name,
             versionCode = code,
-            binaryVersionName = binVersion.takeIf { it.isNotBlank() },
+            binaryVersionName = null,
             raw = out
         )
     }
@@ -581,6 +885,7 @@ object DaemonBridge {
             reason = values["reason"].orEmpty(),
             selection = values["selection"].orEmpty(),
             error = values["error"].orEmpty(),
+            sceneInstalled = values["scene_installed"].toSceneBooleanOrNull(),
             raw = raw
         )
     }
@@ -601,13 +906,53 @@ object DaemonBridge {
             .takeIf { it.isNotBlank() }
     }
 
-    /** 下发开始线程负载采样命令，并等待守护进程进入 sampling 状态。 */
-    fun startCalibration(pkg: String): Boolean {
-        if (pkg.isBlank()) return false
+    /** 下发开始线程负载采样命令，并区分 Root、目标进程和守护确认失败。 */
+    fun startCalibration(pkg: String): CalibrationStartResult {
+        if (pkg.isBlank()) return CalibrationStartResult(CalibrationStartStatus.INVALID_PACKAGE)
         val safe = cleanCommandArg(pkg, allowColon = true)
-        if (safe.isBlank()) return false
-        val wrote = runAsRoot("mkdir -p '$CONFIG_DIR'; printf '%s' 'start $safe' > $CMD_FILE").isNotErrored()
-        return wrote && waitForStatePackage("sampling", safe, timeoutMs = 2500)
+        if (safe.isBlank()) return CalibrationStartResult(CalibrationStartStatus.INVALID_PACKAGE)
+
+        val initialState = readState()
+        val writeResult = runRootCommand(
+            "mkdir -p '$CONFIG_DIR'; printf '%s' 'start $safe' > $CMD_FILE",
+            timeoutSeconds = 5L
+        )
+        if (!writeResult.success) {
+            return CalibrationStartResult(
+                if (writeResult.timedOut) {
+                    CalibrationStartStatus.ROOT_TIMEOUT
+                } else {
+                    CalibrationStartStatus.ROOT_COMMAND_FAILED
+                }
+            )
+        }
+
+        val deadline = System.currentTimeMillis() + 2500L
+        while (System.currentTimeMillis() < deadline) {
+            val state = readState()
+            val status = calibrationStartStatusFromState(state, safe)
+            if (status == CalibrationStartStatus.STARTED ||
+                (state != initialState && status != null)
+            ) {
+                return CalibrationStartResult(status ?: CalibrationStartStatus.DAEMON_NO_RESPONSE, state)
+            }
+            try {
+                Thread.sleep(250)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return CalibrationStartResult(CalibrationStartStatus.DAEMON_NO_RESPONSE, state)
+            }
+        }
+
+        val targetRunning = findRunningProcessNames(listOf(safe)).contains(safe)
+        return CalibrationStartResult(
+            if (targetRunning) {
+                CalibrationStartStatus.DAEMON_NO_RESPONSE
+            } else {
+                CalibrationStartStatus.TARGET_PROCESS_NOT_READY
+            },
+            readState()
+        )
     }
 
     /** 下发停止采样命令，守护进程随后生成规则并回写 applist.conf。 */
@@ -683,13 +1028,38 @@ object DaemonBridge {
         return null
     }
 
-    private fun waitForStatePackage(prefix: String, pkg: String, timeoutMs: Long): Boolean {
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (System.currentTimeMillis() < deadline) {
-            if (statePackage(readState(), prefix) == pkg) return true
-            try { Thread.sleep(250) } catch (_: InterruptedException) { return false }
+    internal fun calibrationStartStatusFromState(
+        state: String,
+        pkg: String
+    ): CalibrationStartStatus? {
+        if (statePackage(state, "sampling") == pkg) return CalibrationStartStatus.STARTED
+        if (stateReason(state) == "busy" && stateField(state, "requested") == pkg) {
+            return CalibrationStartStatus.BUSY
         }
-        return false
+        if (statePackage(state, "rejected") == pkg) {
+            return when (stateReason(state)) {
+                "no_process" -> CalibrationStartStatus.TARGET_PROCESS_NOT_READY
+                else -> CalibrationStartStatus.DAEMON_NO_RESPONSE
+            }
+        }
+        if (statePackage(state, "done") == pkg && stateReason(state) == "short") {
+            return CalibrationStartStatus.TARGET_PROCESS_EXITED
+        }
+        return null
+    }
+
+    private fun stateReason(state: String): String? {
+        return stateField(state, "reason")
+    }
+
+    private fun stateField(state: String, key: String): String? {
+        return state.split(';')
+            .asSequence()
+            .map { it.trim() }
+            .firstOrNull { it.substringBefore('=', missingDelimiterValue = "") == key }
+            ?.substringAfter('=', missingDelimiterValue = "")
+            ?.trim()
+            ?.ifBlank { null }
     }
 
     private fun statePackage(state: String, prefix: String): String? {
@@ -769,6 +1139,14 @@ object DaemonBridge {
         val readSuccess: Boolean
     )
 
+    data class SettingsPolicySnapshot(
+        val hasRoot: Boolean,
+        val moduleVersion: ModuleVersion?,
+        val policyFile: PolicyFile,
+        val cpusetSupported: Boolean,
+        val presentCpus: Set<Int>
+    )
+
     enum class RustDaemonRestartStatus {
         REQUESTED,
         NOT_RUNNING,
@@ -782,6 +1160,107 @@ object DaemonBridge {
                 "then printf 1; else printf 0; fi"
         )
         return result.success && result.output.trim() == "1"
+    }
+
+    /**
+     * 设置页一次性读取 Root、模块版本、策略、cpuset 能力和 CPU 范围。
+     * 这些字段原先会分别启动多个 su，部分 Root 管理器会为每次调用显示提示，
+     * 也会让首次进入设置页明显卡顿。单次快照保持原有只读语义。
+     */
+    fun readSettingsPolicySnapshot(): SettingsPolicySnapshot {
+        val token = UUID.randomUUID().toString().replace("-", "")
+        val begin = "__APPOPT_POLICY_BEGIN_${token}__"
+        val end = "__APPOPT_POLICY_END_${token}__"
+        val binary = shellQuote(BIN_RS_FILE)
+        val command = """
+            uid=${'$'}(id -u 2>/dev/null) || exit 1
+            [ "${'$'}uid" = 0 ] || exit 1
+            prop='$MODULE_DIR/module.prop'
+            prop_code=
+            prop_version=
+            [ -f "${'$'}prop" ] && prop_code=${'$'}(sed -n 's/^versionCode=//p' "${'$'}prop" 2>/dev/null | head -n 1)
+            [ -f "${'$'}prop" ] && prop_version=${'$'}(sed -n 's/^version=//p' "${'$'}prop" 2>/dev/null | head -n 1)
+            if [ -f '$POLICY_UPDATE_FILE' ]; then
+                pending=1
+                policy='$POLICY_UPDATE_FILE'
+            elif [ ! -e '$POLICY_UPDATE_FILE' ]; then
+                pending=0
+                policy='$POLICY_FILE'
+            else
+                exit 1
+            fi
+            if [ -f "${'$'}policy" ]; then
+                exists=1
+            elif [ ! -e "${'$'}policy" ]; then
+                exists=0
+            else
+                exit 1
+            fi
+            if [ -x $binary ] && $binary -h 2>/dev/null | grep -q -- '--cpuset-name'; then
+                cpuset=1
+            else
+                cpuset=0
+            fi
+            present=${'$'}(cat /sys/devices/system/cpu/present 2>/dev/null || true)
+            printf 'uid=%s\npropCode=%s\npropVersion=%s\npending=%s\npolicy=%s\nexists=%s\ncpuset=%s\npresent=%s\n' \
+                "${'$'}uid" "${'$'}prop_code" "${'$'}prop_version" "${'$'}pending" \
+                "${'$'}policy" "${'$'}exists" "${'$'}cpuset" "${'$'}present"
+            printf '%s\n' '$begin'
+            [ "${'$'}exists" = 0 ] || cat "${'$'}policy" || exit 1
+            printf '\n%s\n' '$end'
+        """.trimIndent()
+        val result = readRootCommandResult(command)
+        val failedPolicy = PolicyFile(
+            content = "",
+            lockedByPendingUpdate = false,
+            path = POLICY_FILE,
+            exists = false,
+            readSuccess = false
+        )
+        if (!result.success) {
+            return SettingsPolicySnapshot(false, null, failedPolicy, false, emptySet())
+        }
+        val beginLine = "$begin\n"
+        val beginIndex = result.output.indexOf(beginLine)
+        val contentStart = beginIndex.takeIf { it >= 0 }?.plus(beginLine.length) ?: -1
+        val endIndex = if (contentStart >= 0) result.output.indexOf("\n$end", contentStart) else -1
+        if (beginIndex < 0 || contentStart < 0 || endIndex < contentStart) {
+            return SettingsPolicySnapshot(true, null, failedPolicy, false, emptySet())
+        }
+        val values = result.output.substring(0, beginIndex)
+            .lineSequence()
+            .mapNotNull { line ->
+                val separator = line.indexOf('=')
+                if (separator <= 0) null else line.substring(0, separator) to
+                    line.substring(separator + 1).trimEnd('\r')
+            }
+            .toMap()
+        val path = values["policy"].orEmpty().takeIf(String::isNotBlank) ?: POLICY_FILE
+        val pending = values["pending"] == "1"
+        val exists = values["exists"] == "1"
+        val versionCode = values["propCode"]?.toIntOrNull()
+        val versionName = values["propVersion"].orEmpty().removePrefix("v").trim()
+        val version = versionCode?.let { code ->
+            ModuleVersion(
+                versionName = versionName.ifBlank { code.toString() },
+                versionCode = code,
+                binaryVersionName = null,
+                raw = "propCode=$code\npropVersion=$versionName\n"
+            )
+        }
+        return SettingsPolicySnapshot(
+            hasRoot = values["uid"] == "0",
+            moduleVersion = version,
+            policyFile = PolicyFile(
+                content = if (exists) result.output.substring(contentStart, endIndex) else "",
+                lockedByPendingUpdate = pending,
+                path = path,
+                exists = exists,
+                readSuccess = true
+            ),
+            cpusetSupported = values["cpuset"] == "1",
+            presentCpus = parseCpuRangeList(values["present"].orEmpty())
+        )
     }
 
     fun restartRustDaemon(): RustDaemonRestartStatus {
@@ -1474,7 +1953,13 @@ object DaemonBridge {
         val source = shellQuote("$HISTORY_DIR/$safe.log")
         val claim = shellQuote("$HISTORY_DIR/$safe.log$HISTORY_IMPORT_SUFFIX")
         val invalidPrefix = shellQuote("$HISTORY_DIR/$safe.log.invalid.")
-        return runAsRoot("rm -f $source $claim ${invalidPrefix}*; rmdir '$HISTORY_DIR' 2>/dev/null; true").isNotErrored()
+        val out = runAsRoot(
+            "if ! rm -f $source $claim ${invalidPrefix}*; then printf 0; exit 1; fi; " +
+                "remaining=0; [ -e $source ] && remaining=1; [ -e $claim ] && remaining=1; " +
+                "for f in ${invalidPrefix}*; do [ -e \"\$f\" ] && remaining=1; done; " +
+                "if [ \"\$remaining\" -eq 0 ]; then rmdir '$HISTORY_DIR' 2>/dev/null || true; printf 1; else printf 0; fi"
+        )
+        return out.isNotErrored() && out.substringBefore(ERR_MARK).trim() == "1"
     }
 
     /** history 目录下的一份历史记录文件概要。 */
@@ -1663,8 +2148,109 @@ object DaemonBridge {
 
     private val DEV_NULL = java.io.File("/dev/null")
 
+    private fun newRootSessionFile(): String =
+        "/data/local/tmp/.appopt_root_${android.os.Process.myPid()}_${UUID.randomUUID().toString().replace("-", "")}.state"
+
+    /**
+     * 把实际命令放入独立会话。超时时另一个 su 可以按 PID、starttime 和进程组精确终止整棵命令树，
+     * 避免只杀外层 su 后刷模块等孙进程仍在后台继续执行。
+     */
+    private fun wrapRootSessionCommand(cmd: String, sessionFile: String, marker: String? = null): String {
+        val markerCommand = marker?.let { "printf '%s\\n' ${shellQuote(it)}" }.orEmpty()
+        val quotedCommand = shellQuote(cmd)
+        return """
+            session_file=${shellQuote(sessionFile)}
+            rm -f "${'$'}session_file"
+            $markerCommand
+            if command -v setsid >/dev/null 2>&1; then
+                setsid /system/bin/sh -c $quotedCommand &
+                grouped=1
+            else
+                /system/bin/sh -c $quotedCommand &
+                grouped=0
+            fi
+            child=${'$'}!
+            start=${'$'}(sed 's/^.*) //' "/proc/${'$'}child/stat" 2>/dev/null | awk '{print ${'$'}20}')
+            printf '%s %s %s\n' "${'$'}child" "${'$'}start" "${'$'}grouped" > "${'$'}session_file"
+            wait "${'$'}child"
+            rc=${'$'}?
+            rm -f "${'$'}session_file"
+            exit "${'$'}rc"
+        """.trimIndent()
+    }
+
+    private fun terminateRootSession(sessionFile: String) {
+        val command = """
+            state=${shellQuote(sessionFile)}
+            [ -f "${'$'}state" ] || exit 0
+            read pid start grouped < "${'$'}state"
+            case "${'$'}pid" in ''|*[!0-9]*) rm -f "${'$'}state"; exit 0;; esac
+            current=${'$'}(sed 's/^.*) //' "/proc/${'$'}pid/stat" 2>/dev/null | awk '{print ${'$'}20}')
+            if [ -z "${'$'}start" ] || [ "${'$'}current" != "${'$'}start" ]; then
+                rm -f "${'$'}state"
+                exit 0
+            fi
+            collect_tree() {
+                local parent="${'$'}1" child children children_file status key value ppid used_children=0
+                printf '%s\n' "${'$'}parent"
+                for children_file in "/proc/${'$'}parent/task/"*/children; do
+                    [ -r "${'$'}children_file" ] || continue
+                    used_children=1
+                    children=
+                    IFS= read -r children < "${'$'}children_file" || true
+                    for child in ${'$'}children; do
+                        case "${'$'}child" in ''|*[!0-9]*) continue;; esac
+                        collect_tree "${'$'}child"
+                    done
+                done
+                [ "${'$'}used_children" -eq 1 ] && return
+
+                # 极少数内核未提供 task/*/children；回退时只用 shell 内建读取 PPid，
+                # 避免为 /proc 中的每个进程派生 sed/head，导致清理自身再次超时。
+                for status in /proc/[0-9]*/status; do
+                    [ -r "${'$'}status" ] || continue
+                    child=${'$'}{status#/proc/}; child=${'$'}{child%/status}
+                    ppid=
+                    while IFS=: read -r key value; do
+                        [ "${'$'}key" = PPid ] || continue
+                        set -- ${'$'}value
+                        ppid=${'$'}1
+                        break
+                    done < "${'$'}status"
+                    [ "${'$'}ppid" = "${'$'}parent" ] || continue
+                    collect_tree "${'$'}child"
+                done
+            }
+            if [ "${'$'}grouped" = 1 ]; then
+                kill -TERM -"${'$'}pid" 2>/dev/null || kill -TERM "${'$'}pid" 2>/dev/null || true
+            else
+                targets=${'$'}(collect_tree "${'$'}pid")
+                for target in ${'$'}targets; do kill -TERM "${'$'}target" 2>/dev/null || true; done
+            fi
+            sleep 0.2
+            if [ "${'$'}grouped" = 1 ]; then
+                kill -KILL -"${'$'}pid" 2>/dev/null || kill -KILL "${'$'}pid" 2>/dev/null || true
+            else
+                for target in ${'$'}targets; do kill -KILL "${'$'}target" 2>/dev/null || true; done
+            fi
+            rm -f "${'$'}state"
+        """.trimIndent()
+        try {
+            val cleanup = ProcessBuilder("su", "-c", command)
+                .redirectOutput(ProcessBuilder.Redirect.to(DEV_NULL))
+                .redirectError(ProcessBuilder.Redirect.to(DEV_NULL))
+                .start()
+            if (!cleanup.waitFor(4, TimeUnit.SECONDS)) cleanup.destroyForcibly()
+        } catch (_: Exception) {
+        }
+    }
+
     /** 等待 root 子进程结束，并读取 stdout；超时或非零退出会附加错误标记。 */
-    private fun waitAndRead(process: Process, timeoutSeconds: Long = ROOT_TIMEOUT_SECONDS): String {
+    private fun waitAndRead(
+        process: Process,
+        timeoutSeconds: Long = ROOT_TIMEOUT_SECONDS,
+        sessionFile: String? = null
+    ): String {
         val out = StringBuilder()
         val readFailed = AtomicReference(false)
         val reader = Thread {
@@ -1694,7 +2280,7 @@ object DaemonBridge {
             false
         }
         if (!finished) {
-            stopRootProcess(process, reader)
+            stopRootProcess(process, reader, sessionFile)
             return synchronized(out) { out.toString() } + ERR_MARK + ROOT_TIMEOUT_MARK
         }
 
@@ -1704,7 +2290,8 @@ object DaemonBridge {
     }
 
     /** Root 进程超时后主动关闭读取端，并等待读取线程退出，避免关闭流异常逃逸到主进程。 */
-    private fun stopRootProcess(process: Process, reader: Thread) {
+    private fun stopRootProcess(process: Process, reader: Thread, sessionFile: String? = null) {
+        sessionFile?.let(::terminateRootSession)
         try {
             process.destroyForcibly()
         } catch (_: Exception) {
@@ -1728,6 +2315,7 @@ object DaemonBridge {
     private fun waitAndStream(
         process: Process,
         timeoutSeconds: Long = ROOT_TIMEOUT_SECONDS,
+        sessionFile: String? = null,
         onOutput: (String) -> Unit
     ): RootCommandResult {
         val out = StringBuilder()
@@ -1757,7 +2345,7 @@ object DaemonBridge {
             false
         }
         if (!finished) {
-            stopRootProcess(process, reader)
+            stopRootProcess(process, reader, sessionFile)
             return RootCommandResult(
                 output = synchronized(out) { out.toString() },
                 success = false,
@@ -1783,12 +2371,13 @@ object DaemonBridge {
             // 又不像合并 stderr 那样污染 stdout(hasRoot 等按内容精确解析)。
             // (不用 Redirect.DISCARD: 那是 Java9+ API, Android 上不可用。)
             val marker = "__APPOPT_SU_C_${UUID.randomUUID()}__"
-            val wrapped = "printf '%s\\n' '$marker';\n$cmd"
+            val sessionFile = newRootSessionFile()
+            val wrapped = wrapRootSessionCommand(cmd, sessionFile, marker)
             val process = ProcessBuilder("su", "-c", wrapped)
                 .redirectError(ProcessBuilder.Redirect.to(DEV_NULL))
                 .start()
             try {
-                val output = waitAndRead(process, timeoutSeconds)
+                val output = waitAndRead(process, timeoutSeconds, sessionFile)
                 val clean = stripSuShellMarker(output, marker)
                 if (clean != null) {
                     clean
@@ -1809,16 +2398,17 @@ object DaemonBridge {
     /** 兼容不支持 su -c 的实现，退回到 stdin 写入命令。 */
     private fun runViaStdin(cmd: String, timeoutSeconds: Long = ROOT_TIMEOUT_SECONDS): String {
         return try {
+            val sessionFile = newRootSessionFile()
             val process = ProcessBuilder("su")
                 .redirectError(ProcessBuilder.Redirect.to(DEV_NULL))
                 .start()
             try {
-                DataOutputStream(process.outputStream).use { os ->
-                    os.writeBytes("$cmd\n")
-                    os.writeBytes("exit\n")
-                    os.flush()
+                OutputStreamWriter(process.outputStream, Charsets.UTF_8).use { writer ->
+                    writer.write(wrapRootSessionCommand(cmd, sessionFile))
+                    writer.write("\nexit\n")
+                    writer.flush()
                 }
-                waitAndRead(process, timeoutSeconds)
+                waitAndRead(process, timeoutSeconds, sessionFile)
             } finally {
                 process.destroy()
             }
@@ -1834,13 +2424,14 @@ object DaemonBridge {
     ): RootCommandResult {
         return try {
             val marker = "__APPOPT_SU_C_${UUID.randomUUID()}__"
-            val wrapped = "printf '%s\\n' '$marker';\n$cmd"
+            val sessionFile = newRootSessionFile()
+            val wrapped = wrapRootSessionCommand(cmd, sessionFile, marker)
             val process = ProcessBuilder("su", "-c", wrapped)
                 .redirectError(ProcessBuilder.Redirect.to(DEV_NULL))
                 .start()
             try {
                 var markerSeen = false
-                val result = waitAndStream(process, timeoutSeconds) { chunk ->
+                val result = waitAndStream(process, timeoutSeconds, sessionFile) { chunk ->
                     if (chunk.trimEnd('\r', '\n') == marker) {
                         markerSeen = true
                     } else if (markerSeen) {
@@ -1867,16 +2458,17 @@ object DaemonBridge {
         onOutput: (String) -> Unit
     ): RootCommandResult {
         return try {
+            val sessionFile = newRootSessionFile()
             val process = ProcessBuilder("su")
                 .redirectError(ProcessBuilder.Redirect.to(DEV_NULL))
                 .start()
             try {
-                DataOutputStream(process.outputStream).use { os ->
-                    os.writeBytes("$cmd\n")
-                    os.writeBytes("exit\n")
-                    os.flush()
+                OutputStreamWriter(process.outputStream, Charsets.UTF_8).use { writer ->
+                    writer.write(wrapRootSessionCommand(cmd, sessionFile))
+                    writer.write("\nexit\n")
+                    writer.flush()
                 }
-                waitAndStream(process, timeoutSeconds, onOutput)
+                waitAndStream(process, timeoutSeconds, sessionFile, onOutput)
             } finally {
                 process.destroy()
             }

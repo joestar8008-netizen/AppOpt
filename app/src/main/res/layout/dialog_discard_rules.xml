@@ -18,6 +18,7 @@
         android:background="@drawable/bg_banner" />
 
     <TextView
+        android:id="@+id/discardRulesTitle"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:text="放弃未保存修改"
@@ -26,6 +27,7 @@
         android:textStyle="bold" />
 
     <TextView
+        android:id="@+id/discardRulesMessage"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="6dp"

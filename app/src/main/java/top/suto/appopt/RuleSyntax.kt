@@ -41,6 +41,11 @@ object RuleSyntax {
         val valid: Boolean = true
     )
 
+    private data class FunctionProcessHeader(
+        val name: String,
+        val fallback: String?
+    )
+
     fun parse(text: String): Document {
         val lines = text.lines()
         val segments = mutableListOf<Segment>()
@@ -94,6 +99,7 @@ object RuleSyntax {
                 val effectiveHeader = if (nested) resolvedHeader.copy(format = Format.NESTED) else resolvedHeader
                 val parsed = when (effectiveHeader.format) {
                     Format.NESTED -> parseNestedBody(body, effectiveHeader)
+                    Format.FUNCTION -> parseFunctionBody(body, effectiveHeader)
                     else -> parseBraceBody(body, effectiveHeader)
                 }
                 val segmentValid = effectiveHeader.valid && parsed != null
@@ -154,6 +160,7 @@ object RuleSyntax {
             val args = prefix.removePrefix("app(").removeSuffix(")")
             if (!prefix.endsWith(')')) return Header("", null, Format.FUNCTION, valid = false)
             val values = splitFunctionHeaderArgs(args)
+                ?: return Header("", null, Format.FUNCTION, valid = false)
             val owner = values.firstOrNull().orEmpty()
             val fallback = values.getOrNull(1)
             return Header(
@@ -211,6 +218,64 @@ object RuleSyntax {
         }
         header.fallback?.let { rules += Rule(header.owner, null, it) }
         return rules
+    }
+
+    private fun parseFunctionBody(lines: List<String>, header: Header): List<Rule>? {
+        val rules = mutableListOf<Rule>()
+        var index = 0
+        while (index < lines.size) {
+            val code = codePart(lines[index])
+            if (code.isEmpty() || code.startsWith("#")) {
+                index++
+                continue
+            }
+
+            val process = parseFunctionProcessHeader(code)
+            if (process == null) {
+                if (code == "}" || code.endsWith('{')) return null
+                rules += parseFunctionMember(header.owner, code) ?: return null
+                index++
+                continue
+            }
+
+            val childOwner = processOwner(header.owner, process.name)
+            process.fallback?.let { rules += Rule(childOwner, null, it) }
+            index++
+            var closed = false
+            while (index < lines.size) {
+                val childCode = codePart(lines[index])
+                when {
+                    childCode.isEmpty() || childCode.startsWith("#") -> Unit
+                    childCode == "}" -> {
+                        closed = true
+                        index++
+                        break
+                    }
+                    childCode.endsWith('{') -> return null
+                    else -> {
+                        val childRule = parseFunctionMember(childOwner, childCode) ?: return null
+                        if (childRule.thread == null) return null
+                        rules += childRule
+                    }
+                }
+                index++
+            }
+            if (!closed) return null
+        }
+        header.fallback?.let { rules += Rule(header.owner, null, it) }
+        return rules
+    }
+
+    private fun parseFunctionProcessHeader(code: String): FunctionProcessHeader? {
+        if (!code.startsWith("process(") || !code.endsWith("{") ) return null
+        val call = code.dropLast(1).trimEnd()
+        if (!call.endsWith(')')) return null
+        val args = call.removePrefix("process(").dropLast(1)
+        val values = splitFunctionArgs(args)
+        if (values.size !in 1..2 || values.any(String::isEmpty) || !validMemberName(values[0])) {
+            return null
+        }
+        return FunctionProcessHeader(values[0], values.getOrNull(1))
     }
 
     private fun parseNestedBody(lines: List<String>, header: Header): List<Rule>? {
@@ -346,12 +411,15 @@ object RuleSyntax {
     }
 
     private fun processRule(owner: String, name: String, cpus: String): Rule {
-        val child = when {
+        return Rule(processOwner(owner, name), null, cpus)
+    }
+
+    private fun processOwner(owner: String, name: String): String {
+        return when {
             name.startsWith("$owner:") -> name
             name.startsWith(':') -> owner + name
             else -> "$owner:$name"
         }
-        return Rule(child, null, cpus)
     }
 
     private fun splitAssignment(code: String): Pair<String, String>? {
@@ -363,6 +431,15 @@ object RuleSyntax {
     }
 
     private fun splitFunctionArgs(args: String): List<String> {
+        val trimmed = args.trimStart()
+        if (trimmed.startsWith('"')) {
+            val (name, remainder) = parseQuotedFunctionName(trimmed) ?: return emptyList()
+            val rest = remainder.trim()
+            if (rest.isEmpty()) return listOf(name)
+            if (!rest.startsWith(',')) return emptyList()
+            val cpus = rest.removePrefix(",").trim()
+            return if (cpus.isEmpty()) emptyList() else listOf(name, cpus)
+        }
         for (comma in args.indices) {
             if (args[comma] != ',') continue
             val name = args.substring(0, comma).trim()
@@ -378,12 +455,43 @@ object RuleSyntax {
         )
     }
 
-    private fun splitFunctionHeaderArgs(args: String): List<String> {
-        val comma = args.indexOf(',')
-        return if (comma < 0) listOf(args.trim()) else listOf(
-            args.substring(0, comma).trim(),
-            args.substring(comma + 1).trim()
+    private fun splitFunctionHeaderArgs(args: String): List<String>? {
+        val trimmed = args.trim()
+        if (trimmed.startsWith('"')) {
+            val (name, remainder) = parseQuotedFunctionName(trimmed) ?: return null
+            val rest = remainder.trim()
+            if (rest.isEmpty()) return listOf(name)
+            if (!rest.startsWith(',')) return null
+            val fallback = rest.removePrefix(",").trim()
+            return fallback.takeIf { it.isNotEmpty() }?.let { listOf(name, it) }
+        }
+        val comma = trimmed.indexOf(',')
+        return if (comma < 0) listOf(trimmed) else listOf(
+            trimmed.substring(0, comma).trim(),
+            trimmed.substring(comma + 1).trim()
         )
+    }
+
+    private fun parseQuotedFunctionName(input: String): Pair<String, String>? {
+        if (!input.startsWith('"')) return null
+        val value = StringBuilder()
+        var escaped = false
+        var index = 1
+        while (index < input.length) {
+            val ch = input[index]
+            when {
+                escaped -> {
+                    value.append(ch)
+                    escaped = false
+                }
+                ch == '\\' -> escaped = true
+                ch == '"' -> return value.toString() to input.substring(index + 1)
+                ch.isISOControl() -> return null
+                else -> value.append(ch)
+            }
+            index++
+        }
+        return null
     }
 
     private fun braceBlockEnd(lines: List<String>, start: Int): Int? {

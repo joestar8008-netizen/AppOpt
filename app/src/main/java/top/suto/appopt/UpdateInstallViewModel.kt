@@ -7,6 +7,33 @@ import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
 
+internal object BoundedInstallLog {
+    const val DEFAULT_MAX_CHARS = 64 * 1024
+    private const val TRUNCATION_MARKER = "[较早的安装日志已省略]\n"
+    private const val MAX_LINE_BOUNDARY_SEARCH = 4 * 1024
+
+    fun append(target: StringBuilder, text: String, maxChars: Int = DEFAULT_MAX_CHARS) {
+        if (text.isEmpty()) return
+        require(maxChars > TRUNCATION_MARKER.length)
+        target.append(text)
+        if (target.length <= maxChars) return
+
+        val tailCapacity = maxChars - TRUNCATION_MARKER.length
+        val minimumStart = (target.length - tailCapacity).coerceAtLeast(0)
+        val newline = target.indexOf("\n", minimumStart)
+        val tailStart = if (newline in minimumStart until
+            minOf(target.length, minimumStart + MAX_LINE_BOUNDARY_SEARCH)
+        ) {
+            newline + 1
+        } else {
+            minimumStart
+        }
+        val tail = target.substring(tailStart).takeLast(tailCapacity)
+        target.clear()
+        target.append(TRUNCATION_MARKER).append(tail)
+    }
+}
+
 class UpdateInstallViewModel : ViewModel() {
 
     data class State(
@@ -42,6 +69,7 @@ class UpdateInstallViewModel : ViewModel() {
             zipPath = zipPath,
             inAppUpdate = true,
             context = context.applicationContext,
+            expectedVersionCode = update.remoteVersionCode,
             callback = object : ModuleUpdater.InstallCallback {
                 override fun onProgress(message: String, percent: Int?) {
                     updateState { copy(statusTitle = "正在刷入模块", statusDetail = message) }
@@ -52,6 +80,7 @@ class UpdateInstallViewModel : ViewModel() {
                 }
 
                 override fun onSuccess(message: String) {
+                    ModuleUpdater.clearPersistedDownload(context, update)
                     appendResult(
                         true,
                         listOf("模块已刷入，重启后生效", "App 将在重启后自动更新")
@@ -61,21 +90,26 @@ class UpdateInstallViewModel : ViewModel() {
                         copy(
                             statusTitle = "等待重启",
                             statusDetail = "模块已刷入，重启后生效",
-                            log = logBuffer.toString(),
+                            log = logSnapshot(),
                             running = false,
                             success = true
                         )
                     }
                 }
 
-                override fun onFailure(message: String) {
+                override fun onFailure(message: String, retainedZipPath: String?) {
+                    ModuleUpdater.clearPersistedDownload(context, update)
                     appendResult(false, listOf(message))
                     flushLogPublish()
                     updateState {
                         copy(
                             statusTitle = "刷入失败",
-                            statusDetail = "模块 zip 已保留，可手动刷入",
-                            log = logBuffer.toString(),
+                            statusDetail = if (retainedZipPath != null) {
+                                "模块 zip 已保留，可手动刷入"
+                            } else {
+                                "模块 zip 不存在，请重新下载"
+                            },
+                            log = logSnapshot(),
                             running = false,
                             success = false
                         )
@@ -90,7 +124,7 @@ class UpdateInstallViewModel : ViewModel() {
     }
 
     private fun appendLog(text: String) {
-        logBuffer.append(text)
+        BoundedInstallLog.append(logBuffer, text)
         if (!logPublishScheduled) {
             logPublishScheduled = true
             mainHandler.postDelayed(publishLogRunnable, LOG_PUBLISH_INTERVAL_MS)
@@ -98,7 +132,7 @@ class UpdateInstallViewModel : ViewModel() {
     }
 
     private fun publishLog() {
-        updateState { copy(log = logBuffer.toString()) }
+        updateState { copy(log = logSnapshot()) }
     }
 
     private fun flushLogPublish() {
@@ -107,11 +141,16 @@ class UpdateInstallViewModel : ViewModel() {
     }
 
     private fun appendResult(success: Boolean, lines: List<String>) {
-        logBuffer.append("\n********************************************\n")
-        logBuffer.append(if (success) "- Done\n" else "- Failed\n")
-        lines.forEach { logBuffer.append("- ").append(it).append('\n') }
-        logBuffer.append("********************************************\n")
+        val result = buildString {
+            append("\n********************************************\n")
+            append(if (success) "- Done\n" else "- Failed\n")
+            lines.forEach { append("- ").append(it).append('\n') }
+            append("********************************************\n")
+        }
+        BoundedInstallLog.append(logBuffer, result)
     }
+
+    private fun logSnapshot(): String = logBuffer.toString()
 
     override fun onCleared() {
         mainHandler.removeCallbacks(publishLogRunnable)
@@ -119,6 +158,7 @@ class UpdateInstallViewModel : ViewModel() {
     }
 
     private companion object {
-        const val LOG_PUBLISH_INTERVAL_MS = 100L
+        // TextView 每次赋值都会重新测量整段文本；2 FPS 足以表达刷入进度，又不会频繁重排。
+        const val LOG_PUBLISH_INTERVAL_MS = 500L
     }
 }

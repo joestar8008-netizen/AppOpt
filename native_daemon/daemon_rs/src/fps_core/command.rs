@@ -14,7 +14,7 @@
         let mut selected = Vec::new();
         let mut last_auto_check = Instant::now() - Duration::from_secs(10);
         let mut last_command_error_log: Option<Instant> = None;
-        while !FPS_SHUTDOWN.load(Ordering::Relaxed) {
+        while !crate::shutdown_requested() {
             let auto_check_interval = if selected.is_empty() {
                 Duration::from_secs(10)
             } else {
@@ -43,8 +43,8 @@
                 }
                 let target = selected_jank_foreground(&selected);
                 if manual_pkg.is_none() && target != auto_pkg {
-                    if let Some(old) = monitor.as_mut() {
-                        old.set_adaptive(false);
+                    if let Some(mut old) = monitor.take() {
+                        old.stop("动态调度目标切换");
                     }
                     monitor = target.clone().map(|pkg| {
                         let mut active = FpsMonitor::start(pkg, None, None);
@@ -78,21 +78,12 @@
             if let Some(cmd) = command {
                 if let Some(rest) = cmd.strip_prefix("start ").map(str::trim) {
                     if let Some(mut old) = monitor.take() {
-                        old.stop();
+                        old.stop("切换监测目标");
                     }
                     let parts = rest.split_whitespace().collect::<Vec<_>>();
                     if let Some(pkg) = parts.first().copied().filter(|pkg| !pkg.is_empty()) {
                         let socket_name = parts.get(1).map(|value| (*value).to_string());
                         let socket_token = parts.get(2).map(|value| (*value).to_string());
-                        println!(
-                            "[FPS] 开始监测: pkg={} 数据通道={}",
-                            pkg,
-                            if socket_name.is_some() {
-                                "socket"
-                            } else {
-                                "文件"
-                            }
-                        );
                         monitor = Some(FpsMonitor::start(
                             pkg.to_string(),
                             socket_name,
@@ -114,7 +105,7 @@
                     if let Some(pkg) = target {
                         if monitor.as_ref().is_none_or(|active| active.pkg != pkg) {
                             if let Some(mut old) = monitor.take() {
-                                old.stop();
+                                old.stop("切换到动态调度目标");
                             }
                             monitor = Some(FpsMonitor::start(pkg.clone(), None, None));
                         }
@@ -124,7 +115,7 @@
                         }
                         auto_pkg = Some(pkg);
                     } else if let Some(mut old) = monitor.take() {
-                        old.stop();
+                        old.stop("用户停止");
                     }
                 }
             }
@@ -136,7 +127,7 @@
             }
         }
         if let Some(mut active) = monitor.take() {
-            active.stop();
+            active.stop("守护进程退出");
         }
         Ok(())
     }
@@ -179,10 +170,16 @@
                 selected.iter().any(|item| item == &pkg).then_some(pkg)
             }
             JankForegroundState::Unavailable => {
-                selected
-                    .iter()
-                    .find(|pkg| app_top_state_check(pkg).target_top_app)
-                    .cloned()
+                // cgroup 内容与目标包无关，只扫描一次再和配置集合求交。逐包重复扫描
+                // 会在前台助手不可用且配置较多时把同一批 /proc/cgroup IO 放大数十倍。
+                let top_state = app_top_state_check("");
+                selected.iter().find_map(|pkg| {
+                    top_state
+                        .packages
+                        .iter()
+                        .any(|top_pkg| top_pkg == pkg)
+                        .then(|| pkg.clone())
+                })
             }
         }
     }
@@ -362,19 +359,6 @@
         find_pkg_cmdline_pid(pkg, allow_child, "")
     }
 
-    fn find_foreground_pkg_pid(pkg: &str) -> Option<PidChoice> {
-        // 高频 FPS 校正只应该信“前台事实”，不能退到包名主进程。
-        // helper 新鲜时优先由 helper 判断目标包是否仍在前台；helper 不可用时才信 cgroup。
-        match foreground_helper_state(pkg) {
-            ForegroundHelperState::Target => find_top_app_pid(pkg).map(|mut choice| {
-                choice.source = format!("前台助手+{}", choice.source);
-                choice
-            }),
-            ForegroundHelperState::Other => None,
-            ForegroundHelperState::Unavailable => find_top_app_pid(pkg),
-        }
-    }
-
     fn pid_ready_for_ebpf(pid: i32, pkg: &str) -> bool {
         if pid <= 0 {
             return false;
@@ -389,47 +373,95 @@
         {
             return false;
         }
-        fs::read_to_string(format!("/proc/{pid}/maps"))
-            .ok()
-            .is_some_and(|maps| maps.lines().any(|line| line.contains("libgui.so")))
+        match fs::read_to_string(format!("/proc/{pid}/maps")) {
+            Ok(maps) => maps.lines().any(|line| line.contains("libgui.so")),
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                // Android 17 开始，即使 Magisk Root 也可能被 procfs/SELinux 禁止读取
+                // 其他应用的 maps。bridge 仍能用系统绝对路径附加 libgui，因此这里
+                // 只确认进程至少有可枚举线程，并且设备存在可用的系统 libgui。
+                fs::read_dir(format!("/proc/{pid}/task"))
+                    .ok()
+                    .and_then(|mut entries| entries.next())
+                    .is_some()
+                    && process_libgui_exists(pid)
+            }
+            Err(_) => false,
+        }
     }
 
-    fn find_alternate_pkg_pid(pkg: &str, current_pid: i32) -> Option<PidChoice> {
-        // eBPF 已经锁定一个 PID 但连续没有新帧时，尝试同包其它进程。
-        // 这里仍然只返回具体 PID，避免 Android 上不可靠的全进程 uprobe。
-        match foreground_helper_state(pkg) {
-            ForegroundHelperState::Target => {
-                if let Some(choice) = find_top_app_pid(pkg) {
-                    if choice.pid > 0 && choice.pid != current_pid {
-                        return Some(PidChoice {
-                            pid: choice.pid,
-                            is_main: choice.is_main,
-                            source: format!("前台助手+{}", choice.source),
-                        });
-                    }
-                }
-                return find_alternate_pkg_cmdline_pid(pkg, current_pid, "前台助手+");
+    fn process_libgui_exists(pid: i32) -> bool {
+        let is_64_bit = (|| {
+            let mut file = fs::File::open(format!("/proc/{pid}/exe")).ok()?;
+            let mut header = [0u8; 5];
+            file.read_exact(&mut header).ok()?;
+            if header[..4] != *b"\x7fELF" {
+                return None;
             }
-            ForegroundHelperState::Other => return None,
-            ForegroundHelperState::Unavailable => {}
-        }
-
-        if let Some(choice) = find_top_app_pid(pkg) {
-            if choice.pid > 0 && choice.pid != current_pid {
-                return Some(choice);
+            match header[4] {
+                1 => Some(false),
+                2 => Some(true),
+                _ => None,
             }
-        }
-
-        find_alternate_pkg_cmdline_pid(pkg, current_pid, "")
+        })();
+        let paths = match is_64_bit {
+            Some(false) => ["/system/lib/libgui.so", "/system_ext/lib/libgui.so"].as_slice(),
+            _ => [
+                "/system/lib64/libgui.so",
+                "/system_ext/lib64/libgui.so",
+            ]
+            .as_slice(),
+        };
+        paths.iter().any(|path| fs::metadata(path).is_ok())
     }
 
-    fn find_alternate_pkg_cmdline_pid(
+    fn collect_pkg_ebpf_pids(
         pkg: &str,
-        current_pid: i32,
-        source_prefix: &str,
-    ) -> Option<PidChoice> {
-        let mut child_fallback = None;
-        let entries = fs::read_dir("/proc").ok()?;
+        known: &BTreeSet<i32>,
+        allow_full_scan: bool,
+    ) -> BTreeSet<i32> {
+        // 常规刷新优先复用 daemon 已维护的 pid_cache.tsv，只对目标包候选做身份
+        // 与 libgui 就绪检查。完整 /proc 遍历仅在缓存为空或低频恢复校验时执行。
+        let mut candidates = process_index_find_package_pids(pkg).unwrap_or_default();
+        for pid in known.iter().copied() {
+            if read_cmdline(pid).ok().is_some_and(|cmdline| {
+                cmdline == pkg
+                    || cmdline
+                        .strip_prefix(pkg)
+                        .is_some_and(|suffix| suffix.starts_with(':'))
+            }) {
+                candidates.insert(pid);
+            }
+        }
+        if let Some(choice) = find_foreground_pkg_hint(pkg) {
+            candidates.insert(choice.pid);
+        }
+        if allow_full_scan || candidates.is_empty() {
+            candidates.extend(scan_pkg_ebpf_pids(pkg));
+        }
+        candidates
+            .into_iter()
+            .filter(|pid| known.contains(pid) || pid_ready_for_ebpf(*pid, pkg))
+            .collect()
+    }
+
+    fn find_foreground_pkg_hint(pkg: &str) -> Option<PidChoice> {
+        // 高频目标集合刷新只读取 helper/cgroup，不在这里退回全 /proc。包名兜底由
+        // pid_cache 和低频 scan_pkg_ebpf_pids 负责。
+        match foreground_helper_state(pkg) {
+            ForegroundHelperState::Target => find_top_app_pid(pkg).map(|mut choice| {
+                choice.source = format!("前台助手+{}", choice.source);
+                choice
+            }),
+            ForegroundHelperState::Other => None,
+            ForegroundHelperState::Unavailable => find_top_app_pid(pkg),
+        }
+    }
+
+    fn scan_pkg_ebpf_pids(pkg: &str) -> BTreeSet<i32> {
+        let mut pids = BTreeSet::new();
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return pids;
+        };
         for entry in entries.flatten() {
             let Some(pid) = entry
                 .file_name()
@@ -438,33 +470,18 @@
             else {
                 continue;
             };
-            if pid == current_pid {
-                continue;
-            }
-
             let Ok(cmdline) = read_cmdline(pid) else {
                 continue;
             };
-            if cmdline == pkg {
-                return Some(PidChoice {
-                    pid,
-                    is_main: true,
-                    source: format!("{source_prefix}包名主进程重锁定"),
-                });
-            }
-            if child_fallback.is_none()
-                && cmdline
+            let belongs_to_pkg = cmdline == pkg
+                || cmdline
                     .strip_prefix(pkg)
-                    .is_some_and(|rest| rest.starts_with(':'))
-            {
-                child_fallback = Some(PidChoice {
-                    pid,
-                    is_main: false,
-                    source: format!("{source_prefix}包名子进程重锁定"),
-                });
+                    .is_some_and(|suffix| suffix.starts_with(':'));
+            if belongs_to_pkg && pid_ready_for_ebpf(pid, pkg) {
+                pids.insert(pid);
             }
         }
-        child_fallback
+        pids
     }
 
     fn find_pkg_cmdline_pid(pkg: &str, allow_child: bool, source_prefix: &str) -> Option<PidChoice> {

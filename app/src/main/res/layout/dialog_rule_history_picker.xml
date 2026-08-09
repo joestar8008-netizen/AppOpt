@@ -58,6 +58,7 @@
     </LinearLayout>
 
     <com.google.android.material.textfield.TextInputLayout
+        android:id="@+id/ruleHistorySearchBox"
         style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -86,6 +87,27 @@
             android:clipToPadding="false"
             android:paddingBottom="8dp" />
 
+        <LinearLayout
+            android:id="@+id/ruleHistoryLoading"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:gravity="center"
+            android:orientation="vertical">
+
+            <ProgressBar
+                android:layout_width="32dp"
+                android:layout_height="32dp"
+                android:indeterminate="true" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="正在整理最近的线程记录"
+                android:textColor="@color/text_secondary"
+                android:textSize="13sp" />
+        </LinearLayout>
+
         <TextView
             android:id="@+id/ruleHistoryEmpty"
             android:layout_width="match_parent"
@@ -96,4 +118,14 @@
             android:textSize="13sp"
             android:visibility="gone" />
     </FrameLayout>
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/ruleHistoryConfirm"
+        style="@style/Widget.Material3.Button"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:layout_marginTop="8dp"
+        android:text="添加选中线程"
+        android:textSize="14sp"
+        android:visibility="gone" />
 </LinearLayout>

@@ -194,7 +194,7 @@ object DatabaseMigrator {
             ?: return null
         val max = head.substring(sp1 + 1, sp2).toFloatOrNull()?.takeIf { it.isFinite() && it >= 0f }
             ?: return null
-        val name = head.substring(sp2 + 1).trim()
+        val name = HistoryFieldCodec.decodeName(head.substring(sp2 + 1).trim())
         if (name.isEmpty()) return null
         val samples = seriesStr.split(',')
         if (samples.isEmpty() || samples.any { sample ->

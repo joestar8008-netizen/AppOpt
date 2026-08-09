@@ -46,6 +46,18 @@ fn read_command() -> io::Result<Option<String>> {
     }
 
     let before = fs::metadata(&claimed)?;
+    if before.len() > 512 {
+        eprintln!(
+            "[CALIB] 忽略过大的校准命令文件: bytes={}",
+            before.len()
+        );
+        match fs::remove_file(&claimed) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        return Ok(None);
+    }
     let bytes = match fs::read(&claimed) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -105,15 +117,41 @@ fn read_cmdline(pid: i32) -> io::Result<String> {
     Ok(String::from_utf8_lossy(basename).trim().to_string())
 }
 
-fn read_thread_stat(path: &str) -> Option<(u64, u64)> {
+fn read_thread_stat(path: &str) -> Option<(String, u64, u64)> {
     let text = fs::read_to_string(path).ok()?;
+    parse_thread_stat(&text)
+}
+
+fn parse_thread_stat(text: &str) -> Option<(String, u64, u64)> {
+    let start = text.find('(')?;
     let end = text.rfind(')')?;
-    let rest = text.get(end + 2..)?;
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    let utime = fields.get(11)?.parse::<u64>().ok()?;
-    let stime = fields.get(12)?.parse::<u64>().ok()?;
-    let starttime = fields.get(19)?.parse::<u64>().ok()?;
-    Some((utime + stime, starttime))
+    if start >= end {
+        return None;
+    }
+    // stat 的第二字段与 /proc/<pid>/task/<tid>/comm 来源相同。直接从这里取名，
+    // 可以让每个线程每轮只读取一个 procfs 文件；rfind 能兼容名称自身包含 ')'。
+    let name = text.get(start + 1..end)?.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+
+    let rest = text.get(end + 1..)?.trim_start();
+    let mut utime = None;
+    let mut stime = None;
+    let mut starttime = None;
+    for (index, field) in rest.split_whitespace().enumerate() {
+        match index {
+            // rest 从 stat 的第 3 字段 state 开始，因此 14/15/22 对应 11/12/19。
+            11 => utime = field.parse::<u64>().ok(),
+            12 => stime = field.parse::<u64>().ok(),
+            19 => {
+                starttime = field.parse::<u64>().ok();
+                break;
+            }
+            _ => {}
+        }
+    }
+    Some((name, utime? + stime?, starttime?))
 }
 
 fn parse_pid_text(text: &str) -> Option<i32> {
@@ -141,11 +179,62 @@ fn safe_file_name(name: &str) -> String {
 }
 
 fn safe_history_name(name: &str) -> String {
-    name.chars()
-        .map(|ch| match ch {
-            '|' | ',' | ';' | '\n' | '\r' => '_',
-            ch if ch < ' ' => '_',
-            _ => ch,
-        })
-        .collect()
+    // e1 明确标记可逆格式；旧历史没有此前缀，App 可继续按原样读取。
+    // 仅保留安全可见 ASCII，其余 UTF-8 字节统一百分号编码，避免 | , ; 和控制字符
+    // 破坏主行/子线程详情的分隔结构，也不会把真实线程名永久改成下划线。
+    let mut encoded = String::with_capacity(name.len().saturating_add(3));
+    encoded.push_str("e1:");
+    for byte in name.as_bytes() {
+        if (0x20..=0x7e).contains(byte) && !matches!(*byte, b'%' | b'|' | b',' | b';') {
+            encoded.push(*byte as char);
+        } else {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    encoded
+}
+
+#[cfg(test)]
+mod history_name_tests {
+    use super::{parse_thread_stat, safe_history_name};
+
+    fn stat_line(name: &str) -> String {
+        format!(
+            "123 ({name}) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20"
+        )
+    }
+
+    #[test]
+    fn thread_stat_reuses_comm_and_cpu_fields() {
+        let (name, ticks, starttime) = parse_thread_stat(&stat_line("RenderThread")).unwrap();
+        assert_eq!(name, "RenderThread");
+        assert_eq!(ticks, 23);
+        assert_eq!(starttime, 19);
+    }
+
+    #[test]
+    fn thread_stat_accepts_spaces_and_closing_parentheses_in_name() {
+        let (name, ticks, starttime) =
+            parse_thread_stat(&stat_line("Render ) Thread 2")).unwrap();
+        assert_eq!(name, "Render ) Thread 2");
+        assert_eq!(ticks, 23);
+        assert_eq!(starttime, 19);
+    }
+
+    #[test]
+    fn thread_stat_rejects_empty_or_incomplete_input() {
+        assert!(parse_thread_stat("123 () S 1 2 3").is_none());
+        assert!(parse_thread_stat("123 RenderThread S 1 2 3").is_none());
+        assert!(parse_thread_stat("123 (RenderThread) S 1 2 3").is_none());
+    }
+
+    #[test]
+    fn history_name_uses_versioned_reversible_encoding() {
+        assert_eq!(safe_history_name("RenderThread"), "e1:RenderThread");
+        assert_eq!(safe_history_name("a|b,c;d%"), "e1:a%7Cb%2Cc%3Bd%25");
+        assert_eq!(safe_history_name("线程"), "e1:%E7%BA%BF%E7%A8%8B");
+    }
 }

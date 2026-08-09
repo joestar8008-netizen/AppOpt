@@ -1,14 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:background="@drawable/bg_bottom_sheet_card"
-    android:orientation="vertical"
-    android:paddingStart="20dp"
-    android:paddingTop="10dp"
-    android:paddingEnd="20dp"
-    android:paddingBottom="18dp">
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingStart="20dp"
+        android:paddingTop="10dp"
+        android:paddingEnd="20dp"
+        android:paddingBottom="18dp">
 
     <View
         android:layout_width="42dp"
@@ -37,6 +42,7 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="14dp"
+        android:baselineAligned="false"
         android:orientation="horizontal">
 
         <LinearLayout
@@ -100,12 +106,13 @@
         android:textSize="14sp"
         android:textStyle="bold" />
 
-    <androidx.core.widget.NestedScrollView
+    <LinearLayout
         android:id="@+id/updateChangelogScroll"
         android:layout_width="match_parent"
-        android:layout_height="260dp"
+        android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
         android:background="@drawable/bg_action_row"
+        android:orientation="vertical"
         android:paddingStart="12dp"
         android:paddingTop="10dp"
         android:paddingEnd="12dp"
@@ -117,7 +124,7 @@
             android:layout_height="wrap_content"
             android:textColor="@color/text_primary"
             android:textSize="13sp" />
-    </androidx.core.widget.NestedScrollView>
+    </LinearLayout>
 
     <TextView
         android:id="@+id/updateInstallStatus"
@@ -166,4 +173,5 @@
             android:text="下载并刷入"
             app:cornerRadius="12dp" />
     </LinearLayout>
-</LinearLayout>
+    </LinearLayout>
+</androidx.core.widget.NestedScrollView>

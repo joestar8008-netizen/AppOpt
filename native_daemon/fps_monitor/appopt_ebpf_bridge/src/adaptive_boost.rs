@@ -92,7 +92,6 @@ pub extern "C" fn appopt_jank_recover() -> c_int {
 mod platform {
     use super::AppOptFrameMetrics;
     use crate::adaptive_governor::AdaptiveGovernor;
-    use std::cmp::Ordering;
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::c_void;
     use std::fs;
@@ -103,14 +102,6 @@ mod platform {
     use std::time::{Duration, Instant};
 
     const SAMPLE_INTERVAL: Duration = Duration::from_millis(900);
-    const INITIAL_BASELINE_SAMPLES: usize = 5;
-    const HIGH_BASELINE_SAMPLES: usize = 4;
-    const HIGH_BASELINE_RATIO: f64 = 1.20;
-    const HIGH_BASELINE_TOLERANCE: f64 = 0.10;
-    const LOW_BASELINE_SAMPLES: usize = 6;
-    const LOW_BASELINE_RATIO: f64 = 0.90;
-    const LOW_BASELINE_TOLERANCE: f64 = 0.08;
-    const BASELINE_SMOOTHING: f64 = 0.15;
     const MAX_BOOSTED_THREADS: usize = 16;
     const RECOVERY_FILE: &str = "/data/adb/modules/AppOpt/config/boost.restore";
     const SCHED_FLAG_UTIL_CLAMP_MIN: u64 = 0x20;
@@ -157,12 +148,6 @@ mod platform {
     pub struct JankController {
         pkg: String,
         pid: i32,
-        baseline_samples: Vec<f64>,
-        high_baseline_samples: Vec<f64>,
-        low_baseline_samples: Vec<f64>,
-        baseline_fps: f64,
-        moderate_count: u32,
-        smooth_count: u32,
         stopped_count: u32,
         jank_level: i32,
         boosted: bool,
@@ -183,12 +168,6 @@ mod platform {
             Self {
                 pkg,
                 pid: -1,
-                baseline_samples: Vec::with_capacity(8),
-                high_baseline_samples: Vec::with_capacity(HIGH_BASELINE_SAMPLES + 1),
-                low_baseline_samples: Vec::with_capacity(LOW_BASELINE_SAMPLES + 1),
-                baseline_fps: 0.0,
-                moderate_count: 0,
-                smooth_count: 0,
                 stopped_count: 0,
                 jank_level: 0,
                 boosted: false,
@@ -203,12 +182,11 @@ mod platform {
             }
         }
 
-        #[allow(unreachable_code)]
         pub fn update(
             &mut self,
             pid: i32,
             fps: f64,
-            metrics: Option<&AppOptFrameMetrics>,
+            _metrics: Option<&AppOptFrameMetrics>,
         ) -> Option<(i32, String)> {
             let now = Instant::now();
             if self
@@ -232,13 +210,9 @@ mod platform {
                 return None;
             } else if self.pid > 0 && self.pid != pid {
                 // 同一包的实际出帧进程可能在主进程、渲染子进程之间切换。线程增强
-                // 必须按 PID 恢复并重新采样，但帧率基线属于包/显示档位，不能跟着
-                // 瞬时 PID 清空，否则多进程游戏会反复回到学习阶段。
+                // 必须按新 PID 重新识别，旧 PID 的增强先原样恢复。
                 self.restore();
-                self.high_baseline_samples.clear();
-                self.low_baseline_samples.clear();
                 self.stopped_count = 0;
-                self.thread_sample = None;
                 self.pid = pid;
             } else if self.pid <= 0 {
                 self.pid = pid;
@@ -259,291 +233,44 @@ mod platform {
             }
             self.stopped_count = 0;
 
-            // --- PATCH: دائم — نطبق أقصى تعزيز دائماً طالما اللعبة نشطة،
-            // بدل انتظار كشف تقطيع أو الاعتماد على خط أساس قد ينزلق للأسفل.
+            // ── 永久最大调速 ──────────────────────────────────────────
+            // 只要目标包位于前台且 PID 有效（上面已确认），立即施加最高档
+            // 调速，不再学习帧率基线、不再等待卡顿判定。热点线程只在首次
+            // 识别时采样两轮（第一轮取快照、第二轮算差值并锁定），锁定后
+            // 复用同一批线程，不再反复重新扫描整个进程。只有 PID 消失、
+            // 切换或停止出帧（上面的分支）才会触发恢复。
+            let entering = self.jank_level != 3;
             self.jank_level = 3;
             self.restore_pending = false;
             self.governor.set_level(3);
-            let (detail, applied) = if let Some(first) = self.thread_sample.take() {
-                self.apply_thread_boost(pid, Some(first))
-            } else {
-                self.thread_sample = Some(snapshot_thread_cpu(pid));
-                self.apply_thread_boost(pid, None)
-            };
-            let was_boosted = self.boosted;
-            self.boosted |= applied;
-            if !was_boosted && self.boosted {
-                return Some((
-                    2,
-                    format!("{} 已启用永久最大调速；线程增强：{detail}", self.pkg),
-                ));
-            }
-            return None;
-            // --- END PATCH ---
-
-            #[allow(unreachable_code)]
-            let mild_irregular = metrics.is_some_and(|value| {
-                value.frame_count >= 6
-                    && value.median_interval_ns > 0
-                    && (value.p95_interval_ns > value.median_interval_ns.saturating_mul(15) / 10
-                        || value.max_interval_ns > value.median_interval_ns.saturating_mul(22) / 10)
-            });
-            let irregular = metrics.is_some_and(|value| {
-                value.frame_count >= 6
-                    && value.median_interval_ns > 0
-                    && (value.p95_interval_ns > value.median_interval_ns.saturating_mul(18) / 10
-                        || value.max_interval_ns > value.median_interval_ns.saturating_mul(28) / 10)
-            });
-            let fallback_like = metrics.is_none_or(|value| value.flags & 1 != 0);
-            let stable_frame_time = metrics.is_none_or(|value| {
-                value.flags & 1 != 0
-                    || (value.frame_count >= 6 && value.median_interval_ns > 0 && !mild_irregular)
-            });
-
-            if self.baseline_fps <= 0.0 {
-                self.baseline_samples.push(fps);
-                if self.baseline_samples.len() < INITIAL_BASELINE_SAMPLES {
-                    return None;
-                }
-                self.baseline_samples
-                    .sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
-                self.baseline_fps = self.baseline_samples[self.baseline_samples.len() / 2];
-                return Some((4, format!("已学习帧率基线 {:.1} FPS", self.baseline_fps)));
-            }
-
-            if let Some(candidate) = self.stable_lower_baseline(fps, stable_frame_time) {
-                let previous = self.baseline_fps;
-                let was_active = self.jank_level > 0 || self.boosted || self.restore_pending;
-                let restored = self.restore();
-                self.baseline_fps = candidate;
-                self.moderate_count = 0;
-                self.smooth_count = 0;
-                self.thread_sample = None;
-                self.high_baseline_samples.clear();
-                return Some(if was_active {
-                    if restored {
-                        (
-                            3,
-                            format!(
-                                "检测到稳定帧率档位变化，基线已从 {:.1} 更新为 {:.1} FPS，已恢复增强参数",
-                                previous, candidate
-                            ),
-                        )
-                    } else {
-                        (
-                            4,
-                            format!(
-                                "检测到稳定帧率档位变化，基线已从 {:.1} 更新为 {:.1} FPS，部分增强参数尚未恢复",
-                                previous, candidate
-                            ),
-                        )
-                    }
-                } else {
-                    (
-                        4,
-                        format!("帧率基线已从 {:.1} 更新为 {:.1} FPS", previous, candidate),
-                    )
-                });
-            }
-
-            let ordinary = fps < self.baseline_fps * 0.85 && (mild_irregular || fallback_like);
-            let moderate = fps < self.baseline_fps * 0.75 && (irregular || fallback_like);
-            let severe = fps < self.baseline_fps * 0.55
-                || metrics.is_some_and(|value| {
-                    value.median_interval_ns > 0
-                        && value.max_interval_ns > value.median_interval_ns.saturating_mul(4)
-                });
-            if severe {
-                self.high_baseline_samples.clear();
-                let entering = self.jank_level < 3;
-                self.moderate_count = 0;
-                self.smooth_count = 0;
-                self.jank_level = 3;
-                self.restore_pending = false;
-                self.governor.set_level(3);
-                let (detail, applied) = if let Some(first) = self.thread_sample.take() {
+            let (detail, applied) = if !self.thread_boost_attempted {
+                if let Some(first) = self.thread_sample.take() {
                     self.thread_boost_attempted = true;
                     self.apply_thread_boost(pid, Some(first))
-                } else if !self.thread_boost_attempted {
-                    self.thread_sample = Some(snapshot_thread_cpu(pid));
-                    self.apply_thread_boost(pid, None)
-                } else if self.boosted {
-                    ("沿用已增强线程".to_string(), true)
                 } else {
-                    ("线程增强接口不可用".to_string(), false)
-                };
-                self.boosted |= applied;
-                if entering {
-                    return Some((
-                        2,
-                        format!(
-                            "{} 严重卡顿，已立即进入重度调速；线程增强：{detail}",
-                            self.pkg
-                        ),
-                    ));
-                }
-                return None;
-            }
-
-            if ordinary {
-                self.high_baseline_samples.clear();
-                self.smooth_count = 0;
-                self.moderate_count = if moderate {
-                    self.moderate_count.saturating_add(1)
-                } else {
-                    if self.jank_level < 2 {
-                        self.thread_sample = None;
-                    }
-                    0
-                };
-                if self.moderate_count == 1
-                    && !self.thread_boost_attempted
-                    && self.thread_sample.is_none()
-                {
                     self.thread_sample = Some(snapshot_thread_cpu(pid));
+                    ("正在采集线程负载首轮样本".to_string(), false)
                 }
-                if self.moderate_count >= 2 {
-                    let entering = self.jank_level < 2;
-                    self.jank_level = 2;
-                    self.restore_pending = false;
-                    self.governor.set_level(2);
-                    let (detail, applied) = if let Some(first) = self.thread_sample.take() {
-                        self.thread_boost_attempted = true;
-                        self.apply_thread_boost(pid, Some(first))
-                    } else if self.boosted {
-                        ("沿用已增强线程".to_string(), true)
-                    } else if self.thread_boost_attempted {
-                        ("线程增强接口不可用".to_string(), false)
-                    } else {
-                        self.thread_boost_attempted = true;
-                        self.apply_thread_boost(pid, None)
-                    };
-                    self.boosted |= applied;
-                    if entering {
-                        return Some((
-                            1,
-                            format!("{} 连续卡顿升级为中度档；线程增强：{detail}", self.pkg),
-                        ));
-                    }
-                } else if self.jank_level == 0 {
-                    self.jank_level = 1;
-                    self.restore_pending = false;
-                    self.governor.set_level(1);
-                    return Some((
-                        1,
-                        format!("{} 检测到普通卡顿，已启用轻量 CPU 调速", self.pkg),
-                    ));
-                }
-                return None;
-            }
-
-            self.moderate_count = 0;
-            if self.jank_level == 0 {
-                self.thread_sample = None;
-            }
-            self.smooth_count = if mild_irregular {
-                0
+            } else if self.boosted {
+                ("沿用已锁定的增强线程".to_string(), true)
             } else {
-                self.smooth_count.saturating_add(1)
+                ("当前设备没有可用的增强接口".to_string(), false)
             };
-            if self.jank_level == 0 {
-                if let Some(message) = self.update_smooth_baseline(fps, !mild_irregular) {
-                    return Some((4, message));
-                }
-            } else {
-                self.high_baseline_samples.clear();
-            }
-            if (self.jank_level > 0 || self.boosted || self.restore_pending)
-                && self.smooth_count >= 3
-            {
-                return Some(if self.restore() {
-                    (3, "帧率恢复稳定，已恢复增强参数".to_string())
-                } else {
-                    (
-                        4,
-                        "帧率恢复稳定，部分增强参数尚未恢复，将继续重试".to_string(),
-                    )
-                });
+            self.boosted |= applied;
+            if entering {
+                return Some((
+                    2,
+                    format!("{} 已启用永久最大调速；{detail}", self.pkg),
+                ));
             }
             None
         }
 
         fn reset_learning(&mut self) {
-            self.baseline_samples.clear();
-            self.high_baseline_samples.clear();
-            self.low_baseline_samples.clear();
-            self.baseline_fps = 0.0;
-            self.moderate_count = 0;
-            self.smooth_count = 0;
             self.stopped_count = 0;
             self.jank_level = 0;
             self.thread_boost_attempted = false;
             self.thread_sample = None;
-        }
-
-        fn stable_lower_baseline(&mut self, fps: f64, stable_frame_time: bool) -> Option<f64> {
-            if !stable_frame_time || fps >= self.baseline_fps * LOW_BASELINE_RATIO {
-                self.low_baseline_samples.clear();
-                return None;
-            }
-
-            let stable = if self.low_baseline_samples.is_empty() {
-                true
-            } else {
-                let average = self.low_baseline_samples.iter().sum::<f64>()
-                    / self.low_baseline_samples.len() as f64;
-                (fps - average).abs() <= (average * LOW_BASELINE_TOLERANCE).max(2.0)
-            };
-            if !stable {
-                self.low_baseline_samples.clear();
-            }
-            self.low_baseline_samples.push(fps);
-            if self.low_baseline_samples.len() < LOW_BASELINE_SAMPLES {
-                return None;
-            }
-
-            self.low_baseline_samples
-                .sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
-            let candidate = self.low_baseline_samples[self.low_baseline_samples.len() / 2];
-            self.low_baseline_samples.clear();
-            Some(candidate)
-        }
-
-        fn update_smooth_baseline(&mut self, fps: f64, allow_smoothing: bool) -> Option<String> {
-            if fps >= self.baseline_fps * HIGH_BASELINE_RATIO {
-                let stable = if self.high_baseline_samples.is_empty() {
-                    true
-                } else {
-                    let average = self.high_baseline_samples.iter().sum::<f64>()
-                        / self.high_baseline_samples.len() as f64;
-                    (fps - average).abs() <= (average * HIGH_BASELINE_TOLERANCE).max(2.0)
-                };
-                if !stable {
-                    self.high_baseline_samples.clear();
-                }
-                self.high_baseline_samples.push(fps);
-                if self.high_baseline_samples.len() < HIGH_BASELINE_SAMPLES {
-                    return None;
-                }
-
-                self.high_baseline_samples
-                    .sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
-                let candidate = self.high_baseline_samples[self.high_baseline_samples.len() / 2];
-                self.high_baseline_samples.clear();
-                let previous = self.baseline_fps;
-                self.baseline_fps = candidate;
-                return Some(format!(
-                    "检测到稳定高帧率档位，基线已从 {:.1} 更新为 {:.1} FPS",
-                    previous, candidate
-                ));
-            }
-
-            self.high_baseline_samples.clear();
-            if allow_smoothing {
-                self.baseline_fps =
-                    self.baseline_fps * (1.0 - BASELINE_SMOOTHING) + fps * BASELINE_SMOOTHING;
-            }
-            None
         }
 
         fn apply_thread_boost(
@@ -857,8 +584,6 @@ mod platform {
             self.jank_level = 0;
             self.thread_boost_attempted = self.boosted;
             self.thread_sample = None;
-            self.moderate_count = 0;
-            self.smooth_count = 0;
             !self.restore_pending && !self.boosted
         }
     }
@@ -1020,7 +745,7 @@ mod platform {
     }
 
     fn write_value(path: &Path, value: &str) -> bool {
-        // msm_performance 参数是“逐个 CPU:频率”命令节点，整行写回只会处理第一个参数。
+        // msm_performance 参数是"逐个 CPU:频率"命令节点，整行写回只会处理第一个参数。
         // 因此目标值和恢复值都必须逐项写入。
         if path
             .to_string_lossy()

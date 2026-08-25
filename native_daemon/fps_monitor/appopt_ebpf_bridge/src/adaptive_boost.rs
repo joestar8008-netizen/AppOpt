@@ -203,6 +203,7 @@ mod platform {
             }
         }
 
+        #[allow(unreachable_code)]
         pub fn update(
             &mut self,
             pid: i32,
@@ -257,6 +258,30 @@ mod platform {
                 return None;
             }
             self.stopped_count = 0;
+
+            // --- PATCH: دائم — نطبق أقصى تعزيز دائماً طالما اللعبة نشطة،
+            // بدل انتظار كشف تقطيع أو الاعتماد على خط أساس قد ينزلق للأسفل.
+            self.jank_level = 3;
+            self.restore_pending = false;
+            self.governor.set_level(3);
+            let (detail, applied) = if let Some(first) = self.thread_sample.take() {
+                self.apply_thread_boost(pid, Some(first))
+            } else {
+                self.thread_sample = Some(snapshot_thread_cpu(pid));
+                self.apply_thread_boost(pid, None)
+            };
+            let was_boosted = self.boosted;
+            self.boosted |= applied;
+            if !was_boosted && self.boosted {
+                return Some((
+                    2,
+                    format!("{} 已启用永久最大调速；线程增强：{detail}", self.pkg),
+                ));
+            }
+            return None;
+            // --- END PATCH ---
+
+            #[allow(unreachable_code)]
             let mild_irregular = metrics.is_some_and(|value| {
                 value.frame_count >= 6
                     && value.median_interval_ns > 0

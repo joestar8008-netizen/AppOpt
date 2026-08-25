@@ -542,7 +542,10 @@ mod platform {
                     .max()
                     .unwrap_or_else(|| utils.iter().copied().max().unwrap_or(0));
                 max_util = max_util.max(util);
-                let target_percent = (util.saturating_add(boost).max(floor)).min(100) as u64;
+                // PATCH: دائم — نفرض أقصى تردد ثابت دوماً بدل الحساب الديناميكي.
+                #[allow(unused_variables)]
+                let target_percent: u64 = 100;
+                let _ = (boost, floor);
                 targets.push((
                     index,
                     policy.cpus.clone(),
